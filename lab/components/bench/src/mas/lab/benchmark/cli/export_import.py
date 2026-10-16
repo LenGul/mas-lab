@@ -8,17 +8,18 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from mas.lab.benchmark.run_manager import BenchmarkRunManager
-
 from mas.lab.benchmark.cli.common import _get_trace_cache_dir, _resolve_run_manager_dir
+from mas.lab.benchmark.run_manager import BenchmarkRunManager
 
 logger = logging.getLogger(__name__)
 
 _YAML_SUFFIXES = {".yaml", ".yml"}
 _GENERIC_RUN_DIR_NAMES = {"results", "output", "outputs", "benchmark", "benchmarks"}
+_HF_TOKEN_ENV = "HF_TOKEN"
 
 
 def _find_workspace_root(start: Path) -> Path | None:
@@ -61,7 +62,10 @@ def _maybe_resolve_path(raw: str, base_dir: Path) -> Path | None:
         return None
     if not (
         text.startswith((".", "~", "/"))
-        or any(text.endswith(suffix) for suffix in (".yaml", ".yml", ".json", ".csv", ".md"))
+        or any(
+            text.endswith(suffix)
+            for suffix in (".yaml", ".yml", ".json", ".csv", ".md")
+        )
         or "/" in text
         or "\\" in text
     ):
@@ -141,19 +145,158 @@ def _collect_source_bundle(experiment_yaml: Path) -> dict[str, Any]:
             if resolved.is_file() and resolved.suffix.lower() in _YAML_SUFFIXES:
                 pending_yaml.append(resolved)
 
-    experiment_arc = _archive_source_path(experiment_yaml.resolve(), workspace_root).as_posix()
+    experiment_arc = _archive_source_path(
+        experiment_yaml.resolve(), workspace_root
+    ).as_posix()
     return {
         "workspace_root": str(workspace_root) if workspace_root is not None else None,
         "experiment_yaml_path": str(experiment_yaml.resolve()),
         "experiment_yaml_archive_path": experiment_arc,
-        "entries": sorted(source_entries.values(), key=lambda item: item["archive_path"]),
+        "entries": sorted(
+            source_entries.values(), key=lambda item: item["archive_path"]
+        ),
     }
 
 
-def _default_import_dirname(run_dir_basename: str, short_id: str, experiment_name: str) -> str:
+def _default_import_dirname(
+    run_dir_basename: str, short_id: str, experiment_name: str
+) -> str:
     if run_dir_basename.lower() not in _GENERIC_RUN_DIR_NAMES:
         return run_dir_basename
     return f"{short_id}-{_slugify(experiment_name)}"
+
+
+def _load_manifest_from_tarball(tarball: Path) -> dict[str, Any]:
+    import json as _json
+    import tarfile
+
+    with tarfile.open(tarball, "r:gz") as tar:
+        try:
+            mf_member = tar.getmember("MANIFEST.json")
+        except KeyError as exc:
+            raise ValueError(
+                "Archive is missing MANIFEST.json — was it created by 'benchmark export'?"
+            ) from exc
+        extracted = tar.extractfile(mf_member)
+        if extracted is None:
+            raise ValueError("Archive MANIFEST.json could not be read.")
+        return _json.loads(extracted.read())
+
+
+def _default_hf_path_from_manifest(manifest: dict[str, Any]) -> str:
+    experiment = _slugify(str(manifest.get("experiment_name") or "benchmark"))
+    short_id = _slugify(str(manifest.get("short_id") or "run"))
+    return f"benchmarks/{experiment}/{short_id}/bundle.tar.gz"
+
+
+def _require_hf_token() -> str:
+    import os
+
+    token = os.environ.get(_HF_TOKEN_ENV, "").strip()
+    if not token:
+        raise ValueError(f"{_HF_TOKEN_ENV} is not set.")
+    return token
+
+
+def publish_hf_command(args) -> int:
+    """Upload a benchmark archive tarball to a Hugging Face dataset repository.
+
+    This is intentionally a thin transport layer over ``benchmark export``:
+    the tarball remains the canonical reproducibility artifact, and HF stores
+    that artifact without repacking or changing its contents.
+    """
+    from huggingface_hub import HfApi
+
+    tarball = Path(args.tarball).expanduser().resolve()
+    if not tarball.exists():
+        logger.error("Archive not found: %s", tarball)
+        return 1
+
+    repo_id = str(args.repo_id).strip()
+    if not repo_id:
+        logger.error("--repo-id is required")
+        return 1
+
+    try:
+        manifest = _load_manifest_from_tarball(tarball)
+        token = _require_hf_token()
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+
+    path_in_repo = str(
+        getattr(args, "path_in_repo", "") or ""
+    ).strip() or _default_hf_path_from_manifest(manifest)
+
+    print(f"\nPublishing benchmark archive {tarball.name}")
+    print(f"  Repo:   {repo_id}")
+    print(f"  Path:   {path_in_repo}")
+
+    api = HfApi(token=token)
+    api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
+    api.upload_file(
+        path_or_fileobj=str(tarball),
+        path_in_repo=path_in_repo,
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=f"Upload benchmark archive {manifest.get('short_id', tarball.stem)}",
+    )
+
+    print(
+        f"\n✓ Uploaded to https://huggingface.co/datasets/{repo_id}/tree/main/{path_in_repo.rsplit('/', 1)[0]}"
+    )
+    return 0
+
+
+def import_hf_command(args) -> int:
+    """Download a benchmark archive from Hugging Face and restore it locally.
+
+    The downloaded artifact is passed straight into ``import_command`` so the
+    existing restore logic remains the single source of truth.
+    """
+    from types import SimpleNamespace
+
+    from huggingface_hub import hf_hub_download
+
+    repo_id = str(args.repo_id).strip()
+    path_in_repo = str(args.path_in_repo).strip()
+    if not repo_id:
+        logger.error("--repo-id is required")
+        return 1
+    if not path_in_repo:
+        logger.error("PATH_IN_REPO is required")
+        return 1
+
+    try:
+        token = _require_hf_token()
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+
+    download_root = Path(tempfile.mkdtemp(prefix="mas-lab-hf-import-"))
+    print(f"\nDownloading benchmark archive")
+    print(f"  Repo:   {repo_id}")
+    print(f"  Path:   {path_in_repo}")
+    print(f"  Cache:  {download_root}")
+
+    tarball = Path(
+        hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename=path_in_repo,
+            token=token,
+            local_dir=str(download_root),
+        )
+    ).resolve()
+
+    inner_args = SimpleNamespace(
+        tarball=tarball,
+        output_dir=getattr(args, "output_dir", None),
+        trace_cache_dir=getattr(args, "trace_cache_dir", None),
+        dry_run=getattr(args, "dry_run", False),
+    )
+    return import_command(inner_args)
+
 
 def export_command(args) -> int:
     """Pack a benchmark run into a portable .tar.gz archive.
@@ -185,7 +328,6 @@ def export_command(args) -> int:
     """
     import json as _json
     import tarfile
-    import tempfile
 
     benchmark_id = args.benchmark_id
     include_trace_cache = getattr(args, "include_trace_cache", True)
@@ -240,6 +382,7 @@ def export_command(args) -> int:
         results_csv = run_dir / "results.csv"
         if results_csv.exists():
             import csv as _csv
+
             with open(results_csv) as f:
                 reader = _csv.DictReader(f)
                 for row in reader:
@@ -249,11 +392,17 @@ def export_command(args) -> int:
                         # tc_entry = the direct child of tc_root that holds this trace
                         # e.g. tc_root/<hash>/traces/events.jsonl → tc_root/<hash>
                         try:
-                            tc_entry = tc_root / Path(trace_path_str).relative_to(tc_root).parts[0]
+                            tc_entry = (
+                                tc_root
+                                / Path(trace_path_str).relative_to(tc_root).parts[0]
+                            )
                         except (ValueError, IndexError):
                             # Fallback: walk up until a direct child of tc_root
                             tc_entry = tp.parent
-                            while tc_entry.parent != tc_root and tc_entry.parent != tc_entry:
+                            while (
+                                tc_entry.parent != tc_root
+                                and tc_entry.parent != tc_entry
+                            ):
                                 tc_entry = tc_entry.parent
                         if tc_entry.exists() and tc_entry.parent == tc_root:
                             trace_dirs.append(tc_entry.resolve())
@@ -310,7 +459,9 @@ def export_command(args) -> int:
     size_mb = out_path.stat().st_size / 1_048_576
     print(f"\n✓ Exported {size_mb:.1f} MB → {out_path}")
     print(f"\nTo restore:\n  mas-lab benchmark import {out_path}")
-    print(f"\nTo restore to a temp directory:\n  mas-lab benchmark import {out_path} \\")
+    print(
+        f"\nTo restore to a temp directory:\n  mas-lab benchmark import {out_path} \\"
+    )
     print(f"      --output-dir /tmp/test-bench --trace-cache /tmp/test-trace-cache")
     return 0
 
@@ -329,7 +480,6 @@ def import_command(args) -> int:
     experiment YAML is present, ``experiment_yaml_path`` is redirected to that
     restored copy rather than the original machine-local source path.
     """
-    import json as _json
     import tarfile
 
     tarball = Path(args.tarball).expanduser().resolve()
@@ -339,19 +489,18 @@ def import_command(args) -> int:
         logger.error("Archive not found: %s", tarball)
         return 1
 
-    # Peek at MANIFEST.json inside the archive
-    with tarfile.open(tarball, "r:gz") as tar:
-        try:
-            mf_member = tar.getmember("MANIFEST.json")
-        except KeyError:
-            logger.error("Archive is missing MANIFEST.json — was it created by 'benchmark export'?")
-            return 1
-        manifest = _json.loads(tar.extractfile(mf_member).read())
+    try:
+        manifest = _load_manifest_from_tarball(tarball)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
 
     short_id = manifest["short_id"]
     run_dir_basename = manifest["run_dir_basename"]
     has_trace_cache = manifest.get("has_trace_cache", False)
-    total_runs = manifest.get("total_runs", len(manifest.get("trace_cache_entry_names", [])))
+    total_runs = manifest.get(
+        "total_runs", len(manifest.get("trace_cache_entry_names", []))
+    )
     tc_entry_names: list[str] = manifest.get("trace_cache_entry_names", [])
     experiment_name = manifest.get("experiment_name", short_id)
     experiment_yaml_archive_path = manifest.get("experiment_yaml_archive_path")
@@ -365,8 +514,10 @@ def import_command(args) -> int:
         bench_target = Path(output_dir_arg).expanduser().resolve()
     else:
         from mas.lab import paths as _paths
+
         bench_target = (
-            _paths.benchmark_root() / _default_import_dirname(run_dir_basename, short_id, experiment_name)
+            _paths.benchmark_root()
+            / _default_import_dirname(run_dir_basename, short_id, experiment_name)
         ).resolve()
 
     trace_cache_target = _get_trace_cache_dir(explicit=trace_cache_arg)
@@ -374,10 +525,13 @@ def import_command(args) -> int:
 
     # Determine the data root for the demo hint
     from mas.lab import paths as _paths
+
     data_root = _paths.data_root()
 
     # Count cached entries BEFORE import
-    cached_before = sum(1 for name in tc_entry_names if (trace_cache_target / name).exists())
+    cached_before = sum(
+        1 for name in tc_entry_names if (trace_cache_target / name).exists()
+    )
 
     print(f"\nImporting benchmark {short_id} from {tarball.name}")
     print(f"  Benchmark dir:  {bench_target}")
@@ -386,7 +540,9 @@ def import_command(args) -> int:
     if has_trace_cache:
         print(f"  Trace-cache:    {trace_cache_target}")
     print()
-    print(f"  Before import — cache coverage: {cached_before}/{total_runs} runs available")
+    print(
+        f"  Before import — cache coverage: {cached_before}/{total_runs} runs available"
+    )
     if cached_before == 0 and total_runs > 0:
         print(f"  (to verify from a fresh environment, run first:)")
         print(f"    export {_paths.MAS_DATA_ROOT_ENV}={data_root}")
@@ -395,7 +551,11 @@ def import_command(args) -> int:
 
     if dry_run:
         with tarfile.open(tarball, "r:gz") as tar:
-            members = [m.name for m in tar.getmembers() if not m.name.endswith(".json") or m.name == "MANIFEST.json"]
+            members = [
+                m.name
+                for m in tar.getmembers()
+                if not m.name.endswith(".json") or m.name == "MANIFEST.json"
+            ]
             print(f"  [dry-run — nothing written]")
             print(f"  Archive contains {len(members)} entries")
         return 0
@@ -415,13 +575,13 @@ def import_command(args) -> int:
             if name == "MANIFEST.json":
                 continue
             if name.startswith("trace-cache/"):
-                rel = name[len("trace-cache/"):]
+                rel = name[len("trace-cache/") :]
                 dest = trace_cache_target / rel
             elif name.startswith("source/"):
-                rel = name[len("source/"):]
+                rel = name[len("source/") :]
                 dest = source_target / "source" / rel
             elif name.startswith(run_dir_basename + "/") or name == run_dir_basename:
-                rel = name[len(run_dir_basename):].lstrip("/")
+                rel = name[len(run_dir_basename) :].lstrip("/")
                 dest = bench_target / rel if rel else bench_target
             else:
                 # Unexpected entry — skip
@@ -436,14 +596,16 @@ def import_command(args) -> int:
                 linkname = member.linkname
                 # Strip the run_dir_basename prefix if present (tar hardlink format)
                 if linkname.startswith(run_dir_basename + "/"):
-                    abs_part = linkname[len(run_dir_basename) + 1:]
+                    abs_part = linkname[len(run_dir_basename) + 1 :]
                 else:
                     abs_part = linkname
                 # Find "trace-cache/<hash>/<file>" suffix in the link target
                 tc_marker = "trace-cache/"
                 idx = abs_part.rfind(tc_marker)
                 if idx >= 0:
-                    tc_rel = abs_part[idx + len(tc_marker):]  # e.g. "HASH/events.jsonl"
+                    tc_rel = abs_part[
+                        idx + len(tc_marker) :
+                    ]  # e.g. "HASH/events.jsonl"
                     archive_tc_name = f"trace-cache/{tc_rel}"
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     if archive_tc_name in tc_members_in_archive:
@@ -470,15 +632,18 @@ def import_command(args) -> int:
     meta_path = bench_target / "metadata.yaml"
     if meta_path.exists():
         import yaml as _yaml
+
         raw = _yaml.safe_load(meta_path.read_text()) or {}
         old_run_dir = raw.get("run_dir", "")
         if old_run_dir and old_run_dir != str(bench_target):
             old_prefix = old_run_dir.rstrip("/")
             new_prefix = str(bench_target).rstrip("/")
+
             def _repatch(v: str) -> str:
                 if v and v.startswith(old_prefix):
-                    return new_prefix + v[len(old_prefix):]
+                    return new_prefix + v[len(old_prefix) :]
                 return v
+
             for field in ("run_dir", "results_file", "plots_dir"):
                 if field in raw:
                     raw[field] = _repatch(raw[field])
@@ -491,12 +656,14 @@ def import_command(args) -> int:
             logger.debug("Patched metadata.yaml: %s → %s", old_prefix, new_prefix)
 
     # Count cached entries AFTER import
-    cached_after = sum(1 for name in tc_entry_names if (trace_cache_target / name).exists())
+    cached_after = sum(
+        1 for name in tc_entry_names if (trace_cache_target / name).exists()
+    )
 
     print(f"✓ Imported benchmark {short_id} → {bench_target}")
-    print(f"  After import  — cache coverage: {cached_after}/{total_runs} runs available")
+    print(
+        f"  After import  — cache coverage: {cached_after}/{total_runs} runs available"
+    )
     print()
     print(f"  mas-lab benchmark show {short_id}")
     return 0
-
-

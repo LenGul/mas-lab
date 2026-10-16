@@ -5,8 +5,11 @@ from __future__ import annotations
 
 """Benchmark export/import commands."""
 
+import hashlib
 import logging
+import re
 from pathlib import Path
+from typing import Any
 
 from mas.lab.benchmark.run_manager import BenchmarkRunManager
 
@@ -14,11 +17,153 @@ from mas.lab.benchmark.cli.common import _get_trace_cache_dir, _resolve_run_mana
 
 logger = logging.getLogger(__name__)
 
+_YAML_SUFFIXES = {".yaml", ".yml"}
+_GENERIC_RUN_DIR_NAMES = {"results", "output", "outputs", "benchmark", "benchmarks"}
+
+
+def _find_workspace_root(start: Path) -> Path | None:
+    current = start.resolve()
+    if current.is_file():
+        current = current.parent
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists() or (candidate / "pyproject.toml").exists():
+            return candidate
+    return None
+
+
+def _slugify(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-")
+    return text or "benchmark"
+
+
+def _archive_source_path(path: Path, workspace_root: Path | None) -> Path:
+    resolved = path.resolve()
+    if workspace_root is not None:
+        try:
+            return Path("source") / resolved.relative_to(workspace_root)
+        except ValueError:
+            pass
+    digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:10]
+    return Path("source") / "external" / f"{digest}-{resolved.name}"
+
+
+def _maybe_resolve_path(raw: str, base_dir: Path) -> Path | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if "\n" in text or "\r" in text:
+        return None
+    if len(text) > 240:
+        return None
+    if text.startswith(("env:", "http://", "https://", "library:", "pkg:", "package:")):
+        return None
+    if "{" in text or "}" in text:
+        return None
+    if not (
+        text.startswith((".", "~", "/"))
+        or any(text.endswith(suffix) for suffix in (".yaml", ".yml", ".json", ".csv", ".md"))
+        or "/" in text
+        or "\\" in text
+    ):
+        return None
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = (base_dir / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    try:
+        return candidate if candidate.exists() else None
+    except OSError:
+        return None
+
+
+def _iter_string_fields(node: Any) -> list[tuple[str | None, str]]:
+    out: list[tuple[str | None, str]] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str):
+                out.append((str(key), value))
+            else:
+                out.extend(_iter_string_fields(value))
+    elif isinstance(node, list):
+        for value in node:
+            if isinstance(value, str):
+                out.append((None, value))
+            else:
+                out.extend(_iter_string_fields(value))
+    return out
+
+
+def _collect_source_bundle(experiment_yaml: Path) -> dict[str, Any]:
+    import yaml as _yaml
+
+    workspace_root = _find_workspace_root(experiment_yaml)
+    source_entries: dict[str, dict[str, Any]] = {}
+    pending_yaml: list[Path] = [experiment_yaml.resolve()]
+    seen_yaml: set[Path] = set()
+
+    def _add_entry(path: Path, *, kind: str | None = None) -> None:
+        resolved = path.resolve()
+        entry_kind = kind or ("dir" if resolved.is_dir() else "file")
+        if entry_kind == "app_root" and resolved.is_file():
+            resolved = resolved.parent
+            entry_kind = "dir"
+        arcname = _archive_source_path(resolved, workspace_root).as_posix()
+        source_entries[arcname] = {
+            "original_path": str(resolved),
+            "archive_path": arcname,
+            "kind": entry_kind,
+        }
+
+    _add_entry(experiment_yaml.parent, kind="dir")
+
+    while pending_yaml:
+        yaml_path = pending_yaml.pop()
+        if yaml_path in seen_yaml or not yaml_path.exists():
+            continue
+        seen_yaml.add(yaml_path)
+        try:
+            doc = _yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            logger.debug("suppressed", exc_info=True)
+            continue
+
+        for key, raw in _iter_string_fields(doc):
+            resolved = _maybe_resolve_path(raw, yaml_path.parent)
+            if resolved is None:
+                continue
+            if key == "manifest":
+                _add_entry(resolved.parent, kind="app_root")
+            elif resolved.is_dir() or key == "configs_dir":
+                _add_entry(resolved, kind="dir")
+            else:
+                _add_entry(resolved, kind="file")
+            if resolved.is_file() and resolved.suffix.lower() in _YAML_SUFFIXES:
+                pending_yaml.append(resolved)
+
+    experiment_arc = _archive_source_path(experiment_yaml.resolve(), workspace_root).as_posix()
+    return {
+        "workspace_root": str(workspace_root) if workspace_root is not None else None,
+        "experiment_yaml_path": str(experiment_yaml.resolve()),
+        "experiment_yaml_archive_path": experiment_arc,
+        "entries": sorted(source_entries.values(), key=lambda item: item["archive_path"]),
+    }
+
+
+def _default_import_dirname(run_dir_basename: str, short_id: str, experiment_name: str) -> str:
+    if run_dir_basename.lower() not in _GENERIC_RUN_DIR_NAMES:
+        return run_dir_basename
+    return f"{short_id}-{_slugify(experiment_name)}"
+
 def export_command(args) -> int:
     """Pack a benchmark run into a portable .tar.gz archive.
 
     The archive layout::
 
+        source/                            ← minimal rerun inputs recovered from experiment YAML
+            experiments/...                ← experiment directory (pipelines, local YAMLs)
+            datasets/...                   ← referenced dataset YAMLs
+            apps/...                       ← referenced MAS app tree(s)
         <benchmark_id>/                    ← benchmark output dir
             metadata.yaml
             results.csv
@@ -33,6 +178,10 @@ def export_command(args) -> int:
                 run_info.json
                 ...
         MANIFEST.json                      ← import metadata
+
+    The source bundle is intentionally minimal: it only includes the local
+    experiment inputs needed to understand or re-run the benchmark later,
+    while the benchmark output + trace-cache preserve the actual observed run.
     """
     import json as _json
     import tarfile
@@ -79,6 +228,10 @@ def export_command(args) -> int:
     print(f"\nExporting benchmark {metadata.short_id} → {out_path}")
     print(f"  Run dir:  {run_dir}")
 
+    source_bundle = _collect_source_bundle(Path(metadata.experiment_yaml_path))
+    source_entries = source_bundle["entries"]
+    print(f"  Source entries: {len(source_entries)}")
+
     # Collect trace-cache entries referenced in results.csv / metadata
     trace_dirs: list[Path] = []
     if include_trace_cache:
@@ -115,16 +268,21 @@ def export_command(args) -> int:
         "benchmark_id": metadata.benchmark_id,
         "short_id": metadata.short_id,
         "experiment_name": metadata.experiment_name,
+        "experiment_yaml_path": metadata.experiment_yaml_path,
+        "experiment_yaml_archive_path": source_bundle["experiment_yaml_archive_path"],
         "run_dir_basename": run_dir.name,
         "has_trace_cache": bool(trace_dirs),
         "total_runs": total_runs,
         "trace_cache_entry_names": [d.name for d in trace_dirs],
+        "source_entries": source_entries,
     }
 
     if dry_run:
         print("\n  [dry-run — nothing written]")
         print(f"  Would create: {out_path}")
         print(f"  Benchmark dir: {run_dir}")
+        for entry in source_entries:
+            print(f"  Source:       {entry['original_path']}")
         for td in trace_dirs:
             print(f"  Trace-cache:  {td}")
         return 0
@@ -140,6 +298,9 @@ def export_command(args) -> int:
             tar.add(manifest_path, arcname="MANIFEST.json")
             # Add benchmark run dir
             tar.add(run_dir, arcname=run_dir.name)
+            # Add reproducibility source inputs
+            for entry in source_entries:
+                tar.add(entry["original_path"], arcname=entry["archive_path"])
             # Add trace-cache entries
             for tc_dir in trace_dirs:
                 tar.add(tc_dir, arcname=f"trace-cache/{tc_dir.name}")
@@ -155,7 +316,19 @@ def export_command(args) -> int:
 
 
 def import_command(args) -> int:
-    """Restore a benchmark archive produced by ``benchmark export``."""
+    """Restore a benchmark archive produced by ``benchmark export``.
+
+    Restores three kinds of content:
+
+    - the benchmark output directory itself (results, run_info, plots, per-run traces)
+    - the referenced trace-cache entries needed for replay / inspection
+    - the bundled experiment source inputs under ``<output_dir>/_repro/source``
+
+    During import, absolute paths in ``metadata.yaml`` are patched so the
+    restored benchmark points at the imported output directory. When a bundled
+    experiment YAML is present, ``experiment_yaml_path`` is redirected to that
+    restored copy rather than the original machine-local source path.
+    """
     import json as _json
     import tarfile
 
@@ -180,6 +353,9 @@ def import_command(args) -> int:
     has_trace_cache = manifest.get("has_trace_cache", False)
     total_runs = manifest.get("total_runs", len(manifest.get("trace_cache_entry_names", [])))
     tc_entry_names: list[str] = manifest.get("trace_cache_entry_names", [])
+    experiment_name = manifest.get("experiment_name", short_id)
+    experiment_yaml_archive_path = manifest.get("experiment_yaml_archive_path")
+    source_entries: list[dict[str, Any]] = manifest.get("source_entries", [])
 
     # Resolve target directories
     output_dir_arg = getattr(args, "output_dir", None)
@@ -189,9 +365,12 @@ def import_command(args) -> int:
         bench_target = Path(output_dir_arg).expanduser().resolve()
     else:
         from mas.lab import paths as _paths
-        bench_target = (_paths.benchmark_root() / run_dir_basename).resolve()
+        bench_target = (
+            _paths.benchmark_root() / _default_import_dirname(run_dir_basename, short_id, experiment_name)
+        ).resolve()
 
     trace_cache_target = _get_trace_cache_dir(explicit=trace_cache_arg)
+    source_target = bench_target / "_repro"
 
     # Determine the data root for the demo hint
     from mas.lab import paths as _paths
@@ -202,6 +381,8 @@ def import_command(args) -> int:
 
     print(f"\nImporting benchmark {short_id} from {tarball.name}")
     print(f"  Benchmark dir:  {bench_target}")
+    if source_entries:
+        print(f"  Source bundle:  {source_target}")
     if has_trace_cache:
         print(f"  Trace-cache:    {trace_cache_target}")
     print()
@@ -221,6 +402,7 @@ def import_command(args) -> int:
 
     bench_target.mkdir(parents=True, exist_ok=True)
     trace_cache_target.mkdir(parents=True, exist_ok=True)
+    source_target.mkdir(parents=True, exist_ok=True)
 
     # Extract archive, routing entries to correct destinations
     with tarfile.open(tarball, "r:gz") as tar:
@@ -235,6 +417,9 @@ def import_command(args) -> int:
             if name.startswith("trace-cache/"):
                 rel = name[len("trace-cache/"):]
                 dest = trace_cache_target / rel
+            elif name.startswith("source/"):
+                rel = name[len("source/"):]
+                dest = source_target / "source" / rel
             elif name.startswith(run_dir_basename + "/") or name == run_dir_basename:
                 rel = name[len(run_dir_basename):].lstrip("/")
                 dest = bench_target / rel if rel else bench_target
@@ -294,9 +479,14 @@ def import_command(args) -> int:
                 if v and v.startswith(old_prefix):
                     return new_prefix + v[len(old_prefix):]
                 return v
-            for field in ("run_dir", "results_file", "plots_dir", "experiment_yaml_path"):
+            for field in ("run_dir", "results_file", "plots_dir"):
                 if field in raw:
                     raw[field] = _repatch(raw[field])
+            if experiment_yaml_archive_path:
+                restored_experiment_yaml = source_target / experiment_yaml_archive_path
+                raw["experiment_yaml_path"] = str(restored_experiment_yaml)
+            elif "experiment_yaml_path" in raw:
+                raw["experiment_yaml_path"] = _repatch(raw["experiment_yaml_path"])
             meta_path.write_text(_yaml.dump(raw, default_flow_style=False))
             logger.debug("Patched metadata.yaml: %s → %s", old_prefix, new_prefix)
 

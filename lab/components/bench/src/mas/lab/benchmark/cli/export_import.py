@@ -9,7 +9,7 @@ import hashlib
 import logging
 import re
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from mas.lab.benchmark.cli.common import _get_trace_cache_dir, _resolve_run_manager_dir
@@ -20,6 +20,51 @@ logger = logging.getLogger(__name__)
 _YAML_SUFFIXES = {".yaml", ".yml"}
 _GENERIC_RUN_DIR_NAMES = {"results", "output", "outputs", "benchmark", "benchmarks"}
 _HF_TOKEN_ENV = "HF_TOKEN"
+_SOURCE_ALLOWED_TOP_LEVEL_DIRS = {
+    "agents",
+    "apps",
+    "configs",
+    "data",
+    "datasets",
+    "experiments",
+    "overlays",
+    "pipelines",
+    "prompts",
+    "skills",
+    "tools",
+}
+_SOURCE_EXCLUDE_DIRS = {
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "node_modules",
+    ".venv",
+}
+_SOURCE_SECRET_SUFFIXES = {
+    ".pem",
+    ".key",
+    ".crt",
+    ".cer",
+    ".csr",
+    ".p12",
+    ".pfx",
+    ".jks",
+    ".der",
+}
+_SOURCE_EXCLUDE_FILE_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.test",
+    ".env.development",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "known_hosts",
+    "authorized_keys",
+}
 
 
 def _find_workspace_root(start: Path) -> Path | None:
@@ -98,6 +143,97 @@ def _iter_string_fields(node: Any) -> list[tuple[str | None, str]]:
     return out
 
 
+def _is_sensitive_source_path(path: Path) -> bool:
+    name = path.name.lower()
+    if name.startswith(".env") or name in _SOURCE_EXCLUDE_FILE_NAMES:
+        return True
+    if path.suffix.lower() in _SOURCE_SECRET_SUFFIXES:
+        return True
+    if "private" in name and "key" in name:
+        return True
+    if "cert" in name and path.suffix.lower() in {".pem", ".crt", ".cer"}:
+        return True
+    return False
+
+
+def _is_collectable_source_path(path: Path, *, workspace_root: Path | None) -> bool:
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        return False
+    if workspace_root is not None:
+        try:
+            rel = resolved.relative_to(workspace_root)
+        except ValueError:
+            return False
+        if rel.parts and rel.parts[0] not in _SOURCE_ALLOWED_TOP_LEVEL_DIRS:
+            return False
+    if any(part.lower() in _SOURCE_EXCLUDE_DIRS for part in resolved.parts):
+        return False
+    if _is_sensitive_source_path(resolved):
+        return False
+    return True
+
+
+def _manifest_source_entries(
+    source_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {"archive_path": entry["archive_path"], "kind": entry["kind"]}
+        for entry in source_entries
+    ]
+
+
+def _scan_source_entries_for_secrets(source_entries: list[dict[str, Any]]) -> list[str]:
+    flagged: list[str] = []
+    for entry in source_entries:
+        original = entry.get("original_path")
+        if not original:
+            continue
+        path = Path(original)
+        try:
+            if path.exists() and _is_sensitive_source_path(path):
+                flagged.append(original)
+        except OSError:
+            continue
+    return sorted(set(flagged))
+
+
+def _safe_destination(root: Path, member_name: str) -> Path:
+    text = member_name.replace("\\", "/").strip()
+    if not text or text == ".":
+        return root.resolve()
+    if text.startswith("/"):
+        raise ValueError(f"Refusing to extract absolute member path: {member_name!r}")
+    rel_path = PurePosixPath(text)
+    if rel_path.is_absolute() or ".." in rel_path.parts:
+        raise ValueError(f"Refusing to extract path traversal member: {member_name!r}")
+    safe_parts = [part for part in rel_path.parts if part not in ("", ".")]
+    if not safe_parts:
+        raise ValueError(f"Refusing to extract empty member path: {member_name!r}")
+    dest = (root / Path(*safe_parts)).resolve(strict=False)
+    if not dest.is_relative_to(root.resolve()):
+        raise ValueError(f"Refusing to extract member outside root: {member_name!r}")
+    return dest
+
+
+def _safe_link_target(root: Path, dest: Path, linkname: str) -> Path:
+    text = (linkname or "").replace("\\", "/").strip()
+    if not text:
+        raise ValueError("Refusing to extract empty link target from archive.")
+    if text.startswith("/"):
+        raise ValueError(f"Refusing to extract absolute link target: {linkname!r}")
+    rel_path = PurePosixPath(text)
+    if rel_path.is_absolute() or ".." in rel_path.parts:
+        raise ValueError(f"Refusing to extract link target outside root: {linkname!r}")
+    candidate = (
+        dest.parent / Path(*[part for part in rel_path.parts if part not in ("", ".")])
+    ).resolve(strict=False)
+    if not candidate.is_relative_to(root.resolve()):
+        raise ValueError(f"Refusing to extract link target outside root: {linkname!r}")
+    return candidate
+
+
 def _collect_source_bundle(experiment_yaml: Path) -> dict[str, Any]:
     import yaml as _yaml
 
@@ -107,7 +243,9 @@ def _collect_source_bundle(experiment_yaml: Path) -> dict[str, Any]:
     seen_yaml: set[Path] = set()
 
     def _add_entry(path: Path, *, kind: str | None = None) -> None:
-        resolved = path.resolve()
+        resolved = path.resolve(strict=False)
+        if not _is_collectable_source_path(resolved, workspace_root=workspace_root):
+            return
         entry_kind = kind or ("dir" if resolved.is_dir() else "file")
         if entry_kind == "app_root" and resolved.is_file():
             resolved = resolved.parent
@@ -372,6 +510,12 @@ def export_command(args) -> int:
 
     source_bundle = _collect_source_bundle(Path(metadata.experiment_yaml_path))
     source_entries = source_bundle["entries"]
+    flagged_secrets = _scan_source_entries_for_secrets(source_entries)
+    if flagged_secrets:
+        raise ValueError(
+            "Refusing to export benchmark archive: sensitive files were discovered in the source bundle: "
+            + ", ".join(flagged_secrets)
+        )
     print(f"  Source entries: {len(source_entries)}")
 
     # Collect trace-cache entries referenced in results.csv / metadata
@@ -423,7 +567,7 @@ def export_command(args) -> int:
         "has_trace_cache": bool(trace_dirs),
         "total_runs": total_runs,
         "trace_cache_entry_names": [d.name for d in trace_dirs],
-        "source_entries": source_entries,
+        "source_entries": _manifest_source_entries(source_entries),
     }
 
     if dry_run:
@@ -564,6 +708,12 @@ def import_command(args) -> int:
     trace_cache_target.mkdir(parents=True, exist_ok=True)
     source_target.mkdir(parents=True, exist_ok=True)
 
+    safe_roots = {
+        "trace-cache": trace_cache_target,
+        "source": source_target / "source",
+        "run_dir": bench_target,
+    }
+
     # Extract archive, routing entries to correct destinations
     with tarfile.open(tarball, "r:gz") as tar:
         # Build a quick lookup for trace-cache member names (for hardlink resolution)
@@ -574,17 +724,23 @@ def import_command(args) -> int:
             name = member.name
             if name == "MANIFEST.json":
                 continue
-            if name.startswith("trace-cache/"):
-                rel = name[len("trace-cache/") :]
-                dest = trace_cache_target / rel
-            elif name.startswith("source/"):
-                rel = name[len("source/") :]
-                dest = source_target / "source" / rel
-            elif name.startswith(run_dir_basename + "/") or name == run_dir_basename:
-                rel = name[len(run_dir_basename) :].lstrip("/")
-                dest = bench_target / rel if rel else bench_target
-            else:
-                # Unexpected entry — skip
+            try:
+                if name.startswith("trace-cache/"):
+                    rel = name[len("trace-cache/") :]
+                    dest = _safe_destination(safe_roots["trace-cache"], rel)
+                elif name.startswith("source/"):
+                    rel = name[len("source/") :]
+                    dest = _safe_destination(safe_roots["source"], rel)
+                elif (
+                    name.startswith(run_dir_basename + "/") or name == run_dir_basename
+                ):
+                    rel = name[len(run_dir_basename) :].lstrip("/")
+                    dest = _safe_destination(safe_roots["run_dir"], rel if rel else ".")
+                else:
+                    # Unexpected entry — skip
+                    continue
+            except ValueError as exc:
+                logger.error("Skipping unsafe archive member %s: %s", name, exc)
                 continue
 
             if member.isdir():
@@ -603,9 +759,23 @@ def import_command(args) -> int:
                 tc_marker = "trace-cache/"
                 idx = abs_part.rfind(tc_marker)
                 if idx >= 0:
-                    tc_rel = abs_part[
-                        idx + len(tc_marker) :
-                    ]  # e.g. "HASH/events.jsonl"
+                    tc_rel = abs_part[idx + len(tc_marker) :]
+                    new_target = str(trace_cache_target / tc_rel)
+                    try:
+                        if (
+                            not Path(new_target)
+                            .resolve(strict=False)
+                            .is_relative_to(trace_cache_target.resolve())
+                        ):
+                            raise ValueError("trace-cache target escapes cache root")
+                    except ValueError as exc:
+                        logger.error(
+                            "Skipping unsafe archive link %s -> %s: %s",
+                            name,
+                            linkname,
+                            exc,
+                        )
+                        continue
                     archive_tc_name = f"trace-cache/{tc_rel}"
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     if archive_tc_name in tc_members_in_archive:
@@ -618,10 +788,20 @@ def import_command(args) -> int:
                             dest.write_bytes(fobj.read())
                     else:
                         # Rewrite as symlink to new trace-cache location
-                        new_target = str(trace_cache_target / tc_rel)
                         if dest.is_symlink() or dest.exists():
                             dest.unlink(missing_ok=True)
                         dest.symlink_to(new_target)
+                else:
+                    try:
+                        _safe_link_target(safe_roots["run_dir"], dest, abs_part)
+                    except ValueError as exc:
+                        logger.error(
+                            "Skipping unsafe archive link %s -> %s: %s",
+                            name,
+                            linkname,
+                            exc,
+                        )
+                        continue
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 fobj = tar.extractfile(member)

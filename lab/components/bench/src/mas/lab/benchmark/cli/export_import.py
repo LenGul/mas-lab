@@ -336,6 +336,42 @@ def _require_hf_token() -> str:
     return token
 
 
+def _normalize_hf_visibility(value: str | None) -> str:
+    visibility = (value or "private").strip().lower()
+    if visibility not in {"private", "public"}:
+        raise ValueError("HF visibility must be one of: private, public")
+    return visibility
+
+
+def _extract_commit_sha(result: Any) -> str | None:
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        for key in ("oid", "sha", "commit_id"):
+            value = result.get(key)
+            if value:
+                return str(value)
+        return None
+    for attr in ("oid", "sha", "commit_id"):
+        value = getattr(result, attr, None)
+        if value:
+            return str(value)
+    return None
+
+
+def _verify_sha256(path: Path, expected: str | None) -> None:
+    if not expected:
+        return
+    normalized = expected.strip().lower().removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise ValueError("Expected SHA-256 must be a 64-character hex value.")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != normalized:
+        raise ValueError(
+            f"SHA-256 mismatch for {path}: expected {normalized}, got {actual}"
+        )
+
+
 def publish_hf_command(args) -> int:
     """Upload a benchmark archive tarball to a Hugging Face dataset repository.
 
@@ -358,6 +394,9 @@ def publish_hf_command(args) -> int:
     try:
         manifest = _load_manifest_from_tarball(tarball)
         token = _require_hf_token()
+        visibility = _normalize_hf_visibility(getattr(args, "visibility", None))
+        revision = (getattr(args, "revision", "") or "main").strip() or "main"
+        create_pr = bool(getattr(args, "create_pr", True))
     except ValueError as exc:
         logger.error("%s", exc)
         return 1
@@ -369,20 +408,37 @@ def publish_hf_command(args) -> int:
     print(f"\nPublishing benchmark archive {tarball.name}")
     print(f"  Repo:   {repo_id}")
     print(f"  Path:   {path_in_repo}")
+    print(f"  Visibility: {visibility}")
+    print(f"  Revision: {revision}")
+    print(f"  Review PR: {'yes' if create_pr else 'no'}")
 
     api = HfApi(token=token)
-    api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
-    api.upload_file(
+    api.create_repo(
+        repo_id=repo_id,
+        repo_type="dataset",
+        private=(visibility == "private"),
+        visibility=visibility,
+        exist_ok=True,
+    )
+    result = api.upload_file(
         path_or_fileobj=str(tarball),
         path_in_repo=path_in_repo,
         repo_id=repo_id,
         repo_type="dataset",
+        revision=revision,
+        create_pr=create_pr,
         commit_message=f"Upload benchmark archive {manifest.get('short_id', tarball.stem)}",
     )
-
-    print(
-        f"\n✓ Uploaded to https://huggingface.co/datasets/{repo_id}/tree/main/{path_in_repo.rsplit('/', 1)[0]}"
-    )
+    commit_sha = _extract_commit_sha(result)
+    if commit_sha:
+        print(f"  Commit SHA: {commit_sha}")
+        print(
+            f"\n✓ Uploaded to https://huggingface.co/datasets/{repo_id}/commit/{commit_sha}"
+        )
+    else:
+        print(
+            f"\n✓ Uploaded to https://huggingface.co/datasets/{repo_id}/tree/{revision}/{path_in_repo.rsplit('/', 1)[0]}"
+        )
     return 0
 
 
@@ -407,6 +463,10 @@ def import_hf_command(args) -> int:
 
     try:
         token = _require_hf_token()
+        revision = getattr(args, "revision", None)
+        expected_sha256 = (getattr(args, "sha256", "") or "").strip()
+        if revision is not None:
+            revision = str(revision).strip() or None
     except ValueError as exc:
         logger.error("%s", exc)
         return 1
@@ -415,17 +475,27 @@ def import_hf_command(args) -> int:
     print(f"\nDownloading benchmark archive")
     print(f"  Repo:   {repo_id}")
     print(f"  Path:   {path_in_repo}")
+    if revision:
+        print(f"  Revision: {revision}")
+    if expected_sha256:
+        print(f"  Expected SHA-256: {expected_sha256}")
     print(f"  Cache:  {download_root}")
 
-    tarball = Path(
-        hf_hub_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            filename=path_in_repo,
-            token=token,
-            local_dir=str(download_root),
-        )
-    ).resolve()
+    try:
+        tarball = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                filename=path_in_repo,
+                token=token,
+                revision=revision,
+                local_dir=str(download_root),
+            )
+        ).resolve()
+        _verify_sha256(tarball, expected_sha256)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
 
     inner_args = SimpleNamespace(
         tarball=tarball,

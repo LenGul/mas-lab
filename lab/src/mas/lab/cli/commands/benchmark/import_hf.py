@@ -18,6 +18,16 @@ import click
     help="Hugging Face dataset repo id, e.g. <user-or-org>/<repo>.",
 )
 @click.option(
+    "--revision",
+    default=None,
+    help="Branch or immutable commit SHA to pin the import to.",
+)
+@click.option(
+    "--sha256",
+    default=None,
+    help="Expected SHA-256 digest of the tarball; import fails if the downloaded file does not match.",
+)
+@click.option(
     "--output-dir",
     type=Path,
     default=None,
@@ -39,6 +49,8 @@ import click
 def import_hf_cmd(
     path_in_repo: str,
     repo_id: str,
+    revision: str | None,
+    sha256: str | None,
     output_dir: Path | None,
     trace_cache_dir: Path | None,
     dry_run: bool,
@@ -52,6 +64,8 @@ def import_hf_cmd(
     args = SimpleNamespace(
         repo_id=repo_id,
         path_in_repo=path_in_repo,
+        revision=revision,
+        sha256=sha256,
         output_dir=output_dir,
         trace_cache_dir=trace_cache_dir,
         dry_run=dry_run,

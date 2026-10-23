@@ -11,7 +11,7 @@ import os
 import re
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 from mas.lab.benchmark.cli.common import _get_trace_cache_dir, _resolve_run_manager_dir
 from mas.lab.benchmark.run_manager import BenchmarkRunManager
@@ -269,6 +269,24 @@ def _safe_destination(root: Path, member_name: str) -> Path:
     return dest
 
 
+def _safe_manifest_path(root: Path, value: str | None, *, label: str) -> Path:
+    text = (value or "").replace("\\", "/").strip()
+    if not text:
+        raise ValueError(f"Refusing to use empty {label} from archive manifest.")
+    if text.startswith("/"):
+        raise ValueError(f"Refusing to use absolute {label}: {value!r}")
+    rel_path = PurePosixPath(text)
+    if rel_path.is_absolute() or ".." in rel_path.parts:
+        raise ValueError(f"Refusing to use traversal in {label}: {value!r}")
+    safe_parts = [part for part in rel_path.parts if part not in ("", ".")]
+    if not safe_parts:
+        raise ValueError(f"Refusing to use empty {label}: {value!r}")
+    dest = (root / Path(*safe_parts)).resolve(strict=False)
+    if not dest.is_relative_to(root.resolve()):
+        raise ValueError(f"Refusing to use {label} outside root: {value!r}")
+    return dest
+
+
 def _safe_link_target(root: Path, dest: Path, linkname: str) -> Path:
     text = (linkname or "").replace("\\", "/").strip()
     if not text:
@@ -480,7 +498,7 @@ def publish_hf_command(args) -> int:
         repo_id=repo_id,
         repo_type="dataset",
         private=(visibility == "private"),
-        visibility=visibility,
+        visibility=cast(Any, visibility),
         exist_ok=True,
     )
     result = api.upload_file(
@@ -782,7 +800,6 @@ def import_command(args) -> int:
     )
     tc_entry_names: list[str] = manifest.get("trace_cache_entry_names", [])
     experiment_name = manifest.get("experiment_name", short_id)
-    experiment_yaml_archive_path = manifest.get("experiment_yaml_archive_path")
     source_entries: list[dict[str, Any]] = manifest.get("source_entries", [])
 
     # Resolve target directories
@@ -801,6 +818,17 @@ def import_command(args) -> int:
 
     trace_cache_target = _get_trace_cache_dir(explicit=trace_cache_arg)
     source_target = bench_target / "_repro"
+    experiment_yaml_archive_path = manifest.get("experiment_yaml_archive_path")
+    if experiment_yaml_archive_path:
+        try:
+            _safe_manifest_path(
+                source_target / "source",
+                str(experiment_yaml_archive_path),
+                label="experiment_yaml_archive_path",
+            )
+        except ValueError as exc:
+            logger.error("Skipping unsafe manifest path: %s", exc)
+            return 1
 
     # Determine the data root for the demo hint
     from mas.lab import paths as _paths
@@ -963,7 +991,11 @@ def import_command(args) -> int:
                 if field in raw:
                     raw[field] = _repatch(raw[field])
             if experiment_yaml_archive_path:
-                restored_experiment_yaml = source_target / experiment_yaml_archive_path
+                restored_experiment_yaml = _safe_manifest_path(
+                    source_target / "source",
+                    str(experiment_yaml_archive_path),
+                    label="experiment_yaml_archive_path",
+                )
                 raw["experiment_yaml_path"] = str(restored_experiment_yaml)
             elif "experiment_yaml_path" in raw:
                 raw["experiment_yaml_path"] = _repatch(raw["experiment_yaml_path"])

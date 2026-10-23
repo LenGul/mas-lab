@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -64,6 +65,19 @@ _SOURCE_EXCLUDE_FILE_NAMES = {
     "id_ecdsa",
     "known_hosts",
     "authorized_keys",
+}
+_SOURCE_ALLOWED_FILE_SUFFIXES = {
+    ".yaml",
+    ".yml",
+    ".json",
+    ".toml",
+    ".csv",
+    ".md",
+    ".txt",
+    ".py",
+    ".sh",
+    ".jinja",
+    ".j2",
 }
 
 
@@ -175,6 +189,44 @@ def _is_collectable_source_path(path: Path, *, workspace_root: Path | None) -> b
     return True
 
 
+def _iter_allowed_source_files(
+    root: Path, *, workspace_root: Path | None
+) -> list[Path]:
+    resolved_root = root.resolve(strict=False)
+    if not resolved_root.exists():
+        return []
+    if not _is_collectable_source_path(resolved_root, workspace_root=workspace_root):
+        return []
+
+    files: list[Path] = []
+    for current, dirnames, filenames in os.walk(resolved_root):
+        current_path = Path(current).resolve(strict=False)
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if _is_collectable_source_path(
+                (current_path / dirname).resolve(strict=False),
+                workspace_root=workspace_root,
+            )
+        ]
+
+        for filename in sorted(filenames):
+            candidate = (current_path / filename).resolve(strict=False)
+            if not candidate.is_file():
+                continue
+            if _is_sensitive_source_path(candidate):
+                continue
+            if candidate.suffix.lower() not in _SOURCE_ALLOWED_FILE_SUFFIXES:
+                continue
+            if workspace_root is not None:
+                try:
+                    candidate.relative_to(workspace_root)
+                except ValueError:
+                    continue
+            files.append(candidate)
+    return sorted(set(files))
+
+
 def _manifest_source_entries(
     source_entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -246,16 +298,27 @@ def _collect_source_bundle(experiment_yaml: Path) -> dict[str, Any]:
         resolved = path.resolve(strict=False)
         if not _is_collectable_source_path(resolved, workspace_root=workspace_root):
             return
-        entry_kind = kind or ("dir" if resolved.is_dir() else "file")
-        if entry_kind == "app_root" and resolved.is_file():
-            resolved = resolved.parent
-            entry_kind = "dir"
-        arcname = _archive_source_path(resolved, workspace_root).as_posix()
-        source_entries[arcname] = {
-            "original_path": str(resolved),
-            "archive_path": arcname,
-            "kind": entry_kind,
-        }
+
+        if resolved.is_file():
+            if not _is_sensitive_source_path(resolved):
+                if resolved.suffix.lower() in _SOURCE_ALLOWED_FILE_SUFFIXES:
+                    arcname = _archive_source_path(resolved, workspace_root).as_posix()
+                    source_entries[arcname] = {
+                        "original_path": str(resolved),
+                        "archive_path": arcname,
+                        "kind": "file",
+                    }
+            return
+
+        for candidate in _iter_allowed_source_files(
+            resolved, workspace_root=workspace_root
+        ):
+            arcname = _archive_source_path(candidate, workspace_root).as_posix()
+            source_entries[arcname] = {
+                "original_path": str(candidate),
+                "archive_path": arcname,
+                "kind": "file",
+            }
 
     _add_entry(experiment_yaml.parent, kind="dir")
 
@@ -663,6 +726,8 @@ def export_command(args) -> int:
             tar.add(run_dir, arcname=run_dir.name)
             # Add reproducibility source inputs
             for entry in source_entries:
+                if Path(entry["original_path"]).is_dir():
+                    continue
                 tar.add(entry["original_path"], arcname=entry["archive_path"])
             # Add trace-cache entries
             for tc_dir in trace_dirs:

@@ -5,12 +5,16 @@ __pycache__/
 dist/
 build/
 .venv/
+.demo-ui/
+.demo-ui-mock/
 .env
 .env.local
 .env.*.local
 config.yaml
 !lab/src/mas/lab/templates/**/config.yaml
 !docs/tutorials/**/config.yaml
+!labs/**/config.yaml
+!library-samples/sample-workspace/config.yaml
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
@@ -32,6 +36,7 @@ site/
 
 # Test / coverage artifacts
 .coverage
+coverage.xml
 coverage.json
 **/coverage.json
 
@@ -70,7 +75,8 @@ docker/data/*
 # Local protocol compliance checkouts and reports
 compliance/vendor/
 
-# Session / scratch (do not commit — not gitignored; keep local only)
-# .agents/          local harness playbooks (AGENTS.md points here)
+# Local harness playbooks (not published)
+AGENTS.md
+# .agents/
 COVERAGE_REPORT.md
 MANIFEST_SCHEMA_MAPPING.md

@@ -12,25 +12,22 @@ import {
   createOverlay,
   updateOverlay,
 } from "@/api/apiCalls";
-import {
-  Alert,
-  Box,
-  Button,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogTitle,
-  Stack,
-  Tab,
-  Tabs,
-  TextField,
-  Typography,
-  useTheme,
-} from "@mui/material";
+import { Alert, Box, Stack, Typography, useTheme } from "@mui/material";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { parse, stringify } from "yaml";
+import { scopeHref, useScopeId } from "@/api/scope";
+import {
+  InputField,
+  Button,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Tab,
+  Tabs,
+} from "@open-ui-kit/core";
 
 const TAB_KEYS = ["graph", "yaml"] as const;
 type OverlayTab = (typeof TAB_KEYS)[number];
@@ -40,11 +37,8 @@ const Overlay = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const queryClient = useQueryClient();
-  const { library = "", name: routeName, overlayTab } = useParams<{
-    library: string;
-    name: string;
-    overlayTab: string;
-  }>();
+  const library = useScopeId();
+  const { name: routeName, overlayTab } = useParams();
 
   const isNew = !routeName;
   const overlayName = isNew ? "" : decodeURIComponent(routeName);
@@ -129,7 +123,7 @@ const Overlay = () => {
       return;
     }
 
-    let finalYaml = overlayYaml;
+    let finalYaml: string;
     try {
       const doc = parse(overlayYaml);
       if (!doc.metadata) doc.metadata = {};
@@ -175,7 +169,7 @@ const Overlay = () => {
         message: `Overlay "${trimmedName}" saved.`,
       });
 
-      const newRoute = `/${library}/overlays/${encodeURIComponent(trimmedName)}`;
+      const newRoute = scopeHref(library, `/overlays/${encodeURIComponent(trimmedName)}`);
       if (isNew || trimmedName !== overlayName) {
         navigate(newRoute, { replace: true });
       }
@@ -227,7 +221,7 @@ const Overlay = () => {
             {pageTitle}
           </Typography>
           <Stack direction="row" sx={{ gap: "8px" }}>
-            <Button variant="primary" onClick={handleSaveClick}>
+            <Button variant="gradient" onClick={handleSaveClick}>
               Save
             </Button>
             <Button
@@ -331,9 +325,7 @@ const Overlay = () => {
                     color: theme.palette.warning.main,
                   }}
                 >
-                  {overlayName
-                    ? `${overlayName}.overlay.yaml`
-                    : "overlay.yaml"}
+                  {overlayName || "overlay"}
                 </Typography>
                 <CodeBlock code={overlayYaml} language="yaml" />
               </Box>
@@ -355,40 +347,38 @@ const Overlay = () => {
               {saveError}
             </Alert>
           )}
-          <TextField
-            autoFocus
-            margin="dense"
-            label="Overlay Name"
-            placeholder="Enter a name for the overlay"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            value={nameInput}
-            onChange={(e) => {
-              setNameInput(e.target.value);
-              setSaveError("");
-            }}
-            disabled={saving}
-          />
-          <TextField
-            margin="dense"
-            label="Description"
-            placeholder="Enter a description"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            multiline
-            minRows={2}
-            value={descriptionInput}
-            onChange={(e) => setDescriptionInput(e.target.value)}
-            disabled={saving}
-          />
+          <Stack direction="column" sx={{ gap: "16px" }}>
+            <InputField
+              autoFocus
+              label="Overlay Name"
+              placeholder="Enter a name for the overlay"
+              autoComplete="off"
+              fullWidth
+              value={nameInput}
+              onChange={(e) => {
+                setNameInput(e.target.value);
+                setSaveError("");
+              }}
+              disabled={saving}
+            />
+            <InputField
+              label="Description"
+              placeholder="Enter a description"
+              autoComplete="off"
+              fullWidth
+              multiline
+              minRows={2}
+              value={descriptionInput}
+              onChange={(e) => setDescriptionInput(e.target.value)}
+              disabled={saving}
+            />
+          </Stack>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setSaveDialogOpen(false)} disabled={saving}>
             Cancel
           </Button>
-          <Button variant="primary" onClick={handleDialogSave} disabled={saving}>
+          <Button variant="gradient" onClick={handleDialogSave} disabled={saving}>
             {saving ? "Saving..." : "Save"}
           </Button>
         </DialogActions>

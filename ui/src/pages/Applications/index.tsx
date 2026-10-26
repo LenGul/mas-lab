@@ -1,13 +1,19 @@
 //  Copyright (c) 2026 Cisco Systems, Inc. and its affiliates
 //  SPDX-License-Identifier: Apache-2.0
+import { useState } from "react";
 import { PageWithTitle, MasTable } from "@/components";
-import { Box, Button, Stack, Typography, useTheme } from "@mui/material";
-import { useNavigate, useParams } from "react-router";
+import { Box, Stack, Typography, useTheme } from "@mui/material";
+import { Button } from "@open-ui-kit/core";
+import { useNavigate } from "react-router";
+
+import { CreateItemDialog } from "@/components/CreateItemDialog";
+import { scopeHref, useScopeId } from "@/api/scope";
 
 const Applications = () => {
   const theme = useTheme();
   const navigate = useNavigate();
-  const { library = "" } = useParams<{ library: string }>();
+  const scopeId = useScopeId();
+  const [createOpen, setCreateOpen] = useState(false);
 
   return (
     <Box>
@@ -25,9 +31,7 @@ const Applications = () => {
             >
               Applications
             </Typography>
-            <Button onClick={() => navigate(`/${library}/playground`)}>
-              Add Application
-            </Button>
+            <Button onClick={() => setCreateOpen(true)}>Add Application</Button>
           </Stack>
         }
       >
@@ -35,6 +39,13 @@ const Applications = () => {
           <MasTable />
         </Stack>
       </PageWithTitle>
+      <CreateItemDialog
+        open={createOpen}
+        kind="application"
+        scopeId={scopeId}
+        onClose={() => setCreateOpen(false)}
+        onCreated={(sid, id) => navigate(scopeHref(sid, `/applications/${encodeURIComponent(id)}`))}
+      />
     </Box>
   );
 };

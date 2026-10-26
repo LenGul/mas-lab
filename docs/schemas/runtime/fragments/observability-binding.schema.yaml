@@ -6,7 +6,7 @@ title: ObservabilityBinding
 description: >
   List of observability sink plugin ids (OSS: native, otel). Plugin implementations
   are resolved at runtime from the plugin registry — unknown ids fail at load time.
-  Extended sinks (observe_sdk, etc.) are internal-only; see mas-lab-internal.
+  Further sinks (for example observe_sdk) come from `mas-library-telemetry`.
 type: array
 items:
   oneOf:
@@ -62,8 +62,21 @@ items:
               type: string
             service_name:
               type: string
+              description: >
+                Ignored as MAS identity. Observe SDK service.name is the
+                declared MAS name (metadata.name / app_name).
             app_name:
               type: string
+              minLength: 1
+              not:
+                pattern: "[/\\\\]"
+              description: "Declared MAS name. A filesystem path is not a name."
+            mas_id:
+              type: string
+              minLength: 1
+              not:
+                pattern: "[/\\\\]"
+              description: "Declared MAS name. Same contract as app_name."
             realtime:
               type: boolean
             extensions:

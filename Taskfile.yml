@@ -36,7 +36,7 @@ tasks:
       - task: install
       - uv pip install -e library-samples
       - uv pip install -e "library-skills[all]"
-      - uv pip install pytest pytest-asyncio pytest-cov pytest-timeout import-linter pyyaml click python-dotenv jsonschema httpx httpx2 certifi truststore pyarrow opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+      - uv pip install pytest pytest-asyncio pytest-cov pytest-timeout import-linter pyyaml click python-dotenv jsonschema httpx httpx2 certifi truststore pyarrow opentelemetry-sdk opentelemetry-exporter-otlp-proto-http ruff
 
   mcp-conformance:
     desc: "Compatibility alias for the standalone MCP compliance workflow"
@@ -83,11 +83,124 @@ tasks:
     cmds:
       - python3 scripts/check_literals.py
 
+  verify-lint:
+    desc: "Fast static gates — lockfile, literals, ruff on changed Python"
+    cmds:
+      - task: verify-lock
+      - task: verify:literals
+      - python3 scripts/ruff_changed.py check
+
   verify-unit:
     desc: "Unit tests — repo gates + v2 lab/bench/core packages"
     deps: [install-dev]
+    vars:
+      COVERAGE: '{{.COVERAGE | default "0"}}'
     cmds:
       - "{{.VENV}}/import-linter lint --config lab/.importlinter"
+      - |
+        cov=""
+        if [ "{{.COVERAGE}}" = "1" ]; then
+          cov="--cov=mas.runtime.kernel --cov=mas.runtime.machines --cov=mas.ctl.workspace --cov=mas.lab.benchmark.pipeline --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=0"
+        fi
+        {{.VENV}}/pytest \
+          tests/test_tutorial_manifests_strict.py \
+          tests/test_tutorial_manifests_resolve_refs.py \
+          tests/test_oss_agent_manifests_strict.py \
+          tests/test_lab_manifests_strict.py \
+          tests/test_shipped_manifest_separation.py \
+          tests/test_workspace_imports.py \
+          tests/test_mkdocs_github_stats.py \
+          tests/test_diff_cover_changed.py \
+          tests/test_ruff_changed.py \
+          tests/test_ci_paths.py \
+          tests/test_ci_gate.py \
+          runtime/tests/ \
+          lab/components/core/tests/ \
+          lab/components/bench/tests/ \
+          lab/tests/benchmark/test_experiment_schema.py \
+          ctl/tests/ \
+          $cov \
+          -q --tb=line
+
+  verify-runtime:
+    desc: "runtime/tests — optional coverage on kernel and machines"
+    deps: [install-dev]
+    vars:
+      COVERAGE: '{{.COVERAGE | default "0"}}'
+      COVERAGE_PACKAGE: '{{.COVERAGE_PACKAGE | default "0"}}'
+    cmds:
+      - |
+        cov=""
+        if [ "{{.COVERAGE}}" = "1" ]; then
+          cov="--cov=mas.runtime.kernel --cov=mas.runtime.machines --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=0"
+        fi
+        {{.VENV}}/pytest runtime/tests/ $cov -q --tb=line --durations=20
+      - |
+        if [ "{{.COVERAGE}}" = "1" ]; then
+          python3 scripts/diff_cover_changed.py --coverage coverage.xml --fail-under 90 \
+            --prefix runtime/src/mas/runtime/kernel/ \
+            --prefix runtime/src/mas/runtime/machines/
+        fi
+      - |
+        if [ "{{.COVERAGE_PACKAGE}}" = "1" ]; then
+          {{.VENV}}/coverage report --fail-under=90
+        fi
+
+  verify-ctl:
+    desc: "ctl/tests — optional coverage on workspace"
+    deps: [install-dev]
+    vars:
+      COVERAGE: '{{.COVERAGE | default "0"}}'
+      COVERAGE_PACKAGE: '{{.COVERAGE_PACKAGE | default "0"}}'
+    cmds:
+      - |
+        cov=""
+        if [ "{{.COVERAGE}}" = "1" ]; then
+          cov="--cov=mas.ctl.workspace --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=0"
+        fi
+        {{.VENV}}/pytest ctl/tests/ $cov -q --tb=line --durations=20
+      - |
+        if [ "{{.COVERAGE}}" = "1" ]; then
+          python3 scripts/diff_cover_changed.py --coverage coverage.xml --fail-under 90 \
+            --prefix ctl/src/mas/ctl/workspace/
+        fi
+      - |
+        if [ "{{.COVERAGE_PACKAGE}}" = "1" ]; then
+          {{.VENV}}/coverage report --fail-under=90
+        fi
+
+  verify-lab-unit:
+    desc: "lab core/bench unit tests — optional coverage on pipeline"
+    deps: [install-dev]
+    vars:
+      COVERAGE: '{{.COVERAGE | default "0"}}'
+      COVERAGE_PACKAGE: '{{.COVERAGE_PACKAGE | default "0"}}'
+    cmds:
+      - "{{.VENV}}/import-linter lint --config lab/.importlinter"
+      - |
+        cov=""
+        if [ "{{.COVERAGE}}" = "1" ]; then
+          cov="--cov=mas.lab.benchmark.pipeline --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=0"
+        fi
+        {{.VENV}}/pytest \
+          lab/components/core/tests/ \
+          lab/components/bench/tests/ \
+          lab/tests/benchmark/test_experiment_schema.py \
+          $cov -q --tb=line --durations=20
+      - |
+        if [ "{{.COVERAGE}}" = "1" ]; then
+          python3 scripts/diff_cover_changed.py --coverage coverage.xml --fail-under 90 \
+            --prefix lab/components/bench/src/mas/lab/benchmark/pipeline/
+        fi
+      - |
+        if [ "{{.COVERAGE_PACKAGE}}" = "1" ]; then
+          {{.VENV}}/coverage report --fail-under=90
+        fi
+
+  verify-repo:
+    desc: "Repo-root gates — manifests, CI scripts, workspace imports"
+    deps: [install-dev]
+    cmds:
       - |
         {{.VENV}}/pytest \
           tests/test_tutorial_manifests_strict.py \
@@ -96,38 +209,75 @@ tasks:
           tests/test_lab_manifests_strict.py \
           tests/test_shipped_manifest_separation.py \
           tests/test_workspace_imports.py \
-          runtime/tests/ \
-          lab/components/core/tests/ \
-          lab/components/bench/tests/ \
-          lab/tests/benchmark/test_experiment_schema.py \
-          ctl/tests/ \
-          library-standard/tests/ \
-          library-eval/tests/ \
-          library-ioa/tests/ \
+          tests/test_mkdocs_github_stats.py \
+          tests/test_diff_cover_changed.py \
+          tests/test_ruff_changed.py \
+          tests/test_ci_paths.py \
+          tests/test_ci_gate.py \
+          -q --tb=line --durations=20
+
+  verify-coverage:
+    desc: "Core unit tests with coverage.xml, changed-line 90%, optional package 90%"
+    deps: [install-dev]
+    vars:
+      COVERAGE_PACKAGE: '{{.COVERAGE_PACKAGE | default "0"}}'
+    cmds:
+      - task verify-unit COVERAGE=1
+      - python3 scripts/diff_cover_changed.py --coverage coverage.xml --fail-under 90
+      - |
+        if [ "{{.COVERAGE_PACKAGE}}" = "1" ]; then
+          {{.VENV}}/coverage report --fail-under=90
+        fi
+
+  verify-library:
+    desc: "Ruff + pytest + changed-line coverage for one library"
+    deps: [install-dev]
+    vars:
+      LIB: "{{.LIB}}"
+      COV: "{{.COV}}"
+      FAIL_UNDER: '{{.FAIL_UNDER | default "90"}}'
+    cmds:
+      - python3 scripts/ruff_changed.py check --root {{.LIB}}
+      - |
+        {{.VENV}}/pytest {{.LIB}}/tests \
+          --cov={{.COV}} \
+          --cov-report=term-missing \
+          --cov-report=xml:coverage.xml \
+          --cov-fail-under=0 \
           -q --tb=line
-      - |
-        # Separate invocation: library-skills/tests/ is its own `tests` package
-        # (needs __init__.py for its relative `from .conftest import ...`
-        # imports) and collides with lab/components/bench/tests/'s identically
-        # named package under pytest's default import mode if run in the same
-        # process.
-        {{.VENV}}/pytest library-skills/tests/ -q --tb=line
-      - |
-        # Separate invocation: library-telemetry/tests/'s own tests/conftest.py
-        # collides with the root tests/conftest.py under pytest's default
-        # rootdir-relative import mode if run in the same process (same
-        # reasoning as library-skills/tests/ above).
-        {{.VENV}}/pytest library-telemetry/tests/ -q --tb=line
-      - |
-        # Separate invocation: library-kg/tests/ has the same tests/conftest.py
-        # collision as library-telemetry/tests/ above.
-        {{.VENV}}/pytest library-kg/tests/ -q --tb=line
+      - python3 scripts/diff_cover_changed.py --coverage coverage.xml --fail-under {{.FAIL_UNDER}} --prefix {{.LIB}}/src/
+
+  verify-libraries:
+    desc: "Ruff + pytest + changed-line coverage for every library-*"
+    deps: [install-dev]
+    cmds:
+      - task verify-library LIB=library-standard COV=mas.library.standard
+      - task verify-library LIB=library-eval COV=mas.library.eval
+      - task verify-library LIB=library-ioa COV=library_ioa
+      - task verify-library LIB=library-telemetry COV=mas.library.telemetry
+      - task verify-library LIB=library-kg COV=mas.library.kg FAIL_UNDER=80
+      - task verify-library LIB=library-skills COV=mas.library.skills
+      - task verify-library LIB=library-samples COV=mas.library.samples
+      - task verify-library LIB=library-lab COV=mas.library.lab
+
+  verify-hitl:
+    desc: "Chat-smoke validate plus scripted HITL gate"
+    deps: [install-dev]
+    cmds:
+      - task: verify-chat-smoke
+      - task: verify-hitl-gate
 
   verify-controller:
     desc: "All controller unit tests (FastAPI routes, daemon IPC, workers, discovery, manifests)"
     deps: [install-dev]
     cmds:
       - "{{.VENV}}/pytest lab/components/controller/tests/ -q --tb=line"
+
+  verify-demo-ui:
+    desc: "Demo UI host unit tests (node --test)"
+    cmds:
+      - node --test src/*.test.js
+    dir: demo-ui
 
   verify-tutorials:
     desc: "Tutorial integration tests (subprocess CLI; no mas-lab-tutorial package required)"
@@ -176,26 +326,35 @@ tasks:
       - task: verify-tutorials
 
   ci:
-    desc: "CI parity — same gates as .github/workflows/test.yml (unit + functional + dry-run + chat smoke + HITL)"
+    desc: "Optional local sequential run of every verify-* task. GitHub does not run this."
     deps: [install-dev]
     cmds:
-      - task: verify-lock
+      - task: verify-lint
       - task: verify-docs
-      - task: verify:literals
       - task: verify-unit
+      - task: verify-libraries
       - task: verify-controller
+      - task: verify-demo-ui
       - task: verify-functional
       - task: validate
-      - task: verify-chat-smoke
-      - task: verify-hitl-gate
+      - task: verify-hitl
 
   ci-fast:
-    desc: "Fast CI — literals + unit gate only (skips slow functional/dry-run gates)."
+    desc: "Local fail-fast — lint then unit. Closest laptop equivalent to the PR critical path."
     deps: [install-dev]
     cmds:
-      - task: verify-lock
-      - task: verify:literals
+      - task: verify-lint
       - task: verify-unit
+
+  install-hooks:
+    desc: "Install a pre-push hook that runs task verify-lint"
+    cmds:
+      - |
+        hook="$(git rev-parse --git-path hooks)/pre-push"
+        mkdir -p "$(dirname "$hook")"
+        cp "{{.ROOT_DIR}}/scripts/git-hooks/pre-push" "$hook"
+        chmod +x "$hook"
+        echo "Installed $hook — runs task verify-lint on git push"
 
   verify-hitl-gate:
     desc: "Scripted HITL on tool — hitl_gate in events.jsonl (ctl + CLI paths)"
@@ -204,7 +363,7 @@ tasks:
       - "{{.VENV}}/pytest tests/test_hitl_tool_gate.py -q --tb=short"
 
   verify-reproduce:
-    desc: "Outshift-open reproduction gate — docs check, all lab dry-runs, HITL gate"
+    desc: "Reproduction gate — docs check, all lab dry-runs, HITL gate"
     deps: [install-dev]
     cmds:
       - "{{.VENV}}/python scripts/gen_docs.py --check"
@@ -235,7 +394,24 @@ tasks:
         T01="{{.ROOT_DIR}}/docs/tutorials/01-building-an-agent"
         {{.VENV}}/mas-ctl validate "$T01/agent.yaml"
         {{.VENV}}/mas-ctl validate "$T01/agent.yaml" -o "$T01/overlays/tools.yaml"
-        {{.VENV}}/pytest tests/test_hitl_tool_gate.py::test_cli_batch_hitl_emits_hitl_gate -q --tb=short
+
+  ui-test:
+    desc: "UI unit tests (Vitest + MSW)"
+    dir: ui
+    cmds:
+      - ./node_modules/.bin/vitest run
+
+  ui-e2e:
+    desc: "UI Playwright smoke (starts Vite unless PLAYWRIGHT_SKIP_WEBSERVER=1)"
+    dir: ui
+    cmds:
+      - ./node_modules/.bin/playwright test --grep-invert remote
+
+  ui-remote-test:
+    desc: "UI remote e2e — requires MAS_LAB_REMOTE_API (and optional MAS_LAB_REMOTE_TOKEN)"
+    dir: ui
+    cmds:
+      - ./node_modules/.bin/playwright test e2e/remote.spec.ts
 
   verify:
     desc: "Full pre-commit gate — CI gates + local env check, version check"
@@ -244,6 +420,8 @@ tasks:
       - python3 scripts/version_manager.py check
       - task: verify-ctl-env
       - task: ci
+      - task: ui-test
+      - task: ui-e2e
 
   test:
     desc: "Run full verify suite (verbose tutorials)"
@@ -282,6 +460,219 @@ tasks:
     cmds:
       - uv pip install -r requirements-docs.txt --python {{.VENV}}/python
       - "{{.VENV}}/mkdocs serve"
+
+  docs-build:
+    desc: "Build MkDocs site to site/ (same as Pages CI)."
+    cmds:
+      - uv pip install -r requirements-docs.txt --python {{.VENV}}/python
+      - "{{.VENV}}/mkdocs build"
+
+  docker-rebuild:
+    desc: "Remove local mas-lab images and rebuild Docker stack from scratch."
+    dir: "{{.DOCKER_DIR}}"
+    cmds:
+      - docker compose down --rmi local 2>/dev/null || true
+      - docker rmi mas-lab-backend:local mas-lab-ui:local 2>/dev/null || true
+      - docker compose build --no-cache backend
+      - docker compose build --no-cache ui
+
+  version:
+    desc: Get current lab version
+    cmds:
+      - python3 scripts/version_manager.py get lab
+
+  version-all:
+    desc: Get all package versions
+    cmds:
+      - python3 scripts/version_manager.py get all
+
+  version-check:
+    desc: Verify all package versions match VERSION
+    cmds:
+      - python3 scripts/version_manager.py check
+
+  version-set:
+    desc: "Set version for all packages (usage: task version-set -- 0.1.0)"
+    cmds:
+      - python3 scripts/version_manager.py set {{.CLI_ARGS}} all
+
+  version-bump-patch:
+    desc: Bump patch version for all packages
+    cmds:
+      - python3 scripts/version_manager.py bump patch all
+
+  version-bump-minor:
+    desc: Bump minor version for all packages
+    cmds:
+      - python3 scripts/version_manager.py bump minor all
+
+  version-bump-major:
+    desc: Bump major version for all packages
+    cmds:
+      - python3 scripts/version_manager.py bump major all
+
+  release-prepare:
+    desc: Verify release readiness before tagging
+    cmds:
+      - python3 scripts/version_manager.py check
+      - git status --short
+
+  release-tag:
+    desc: Create annotated release tag from VERSION
+    cmds:
+      - |
+        VERSION=$(python3 scripts/version_manager.py get lab)
+        git tag -a "v${VERSION}" -m "Release v${VERSION}"
+        echo "Created tag v${VERSION}"
+
+  release-publish:
+    desc: Push main and release tags
+    cmds:
+      - git push origin main
+      - git push origin --tags
+
+  release-minor:
+    desc: Bump minor version, commit VERSION sync, create and push release tag (triggers image build)
+    cmds:
+      - python3 scripts/version_manager.py check
+      - python3 scripts/version_manager.py bump minor all
+      - |
+        VERSION=$(python3 scripts/version_manager.py get lab)
+        git add VERSION
+        git add */pyproject.toml lab/components/*/pyproject.toml
+        if git diff --cached --quiet; then
+          echo "No version files changed"
+          exit 1
+        fi
+        git commit -m "chore: release v${VERSION}"
+        git tag -a "v${VERSION}" -m "Release v${VERSION}"
+        echo "Created v${VERSION} — run: git push origin main && git push origin v${VERSION}"
+
+  start:
+    desc: "Start MAS Lab UI + backend via Docker Compose (detached)."
+    summary: |
+      Builds images if needed, then runs UI (8080) and backend (8090) in the background.
+      OPENAI_API_KEY must be in docker/.env (containers do not see shell exports).
+      On first run, copies your shell OPENAI_API_KEY into docker/.env when the file has none.
+    dir: "{{.DOCKER_DIR}}"
+    cmds:
+      - task: ensure-docker-env
+      - docker compose up --build -d
+      - task: verify-env
+      - echo "UI  http://localhost:8080"
+      - echo "API http://localhost:8090/api/health"
+
+  restart:
+    desc: "Rebuild (if needed) and recreate UI + backend — reload docker/.env and code."
+    summary: |
+      Use after editing docker/.env or pulling code changes. Rebuilds images when
+      sources changed, then force-recreates both services. Verify with: task verify-env
+    dir: "{{.DOCKER_DIR}}"
+    cmds:
+      - task: ensure-docker-env
+      - docker compose up --build -d --force-recreate
+      - task: verify-env
+      - docker compose ps
+
+  ensure-docker-env:
+    desc: "Ensure docker/.env exists and contains OPENAI_API_KEY for containers."
+    internal: true
+    dir: "{{.DOCKER_DIR}}"
+    cmds:
+      - test -f .env || cp .env.example .env
+      - |
+        if grep -qE '^OPENAI_API_KEY=.+$' .env 2>/dev/null; then
+          exit 0
+        fi
+        if [ -n "${OPENAI_API_KEY:-}" ]; then
+          if grep -q '^OPENAI_API_KEY=' .env 2>/dev/null; then
+            sed -i.bak "s|^OPENAI_API_KEY=.*|OPENAI_API_KEY=${OPENAI_API_KEY}|" .env && rm -f .env.bak
+          else
+            printf '\nOPENAI_API_KEY=%s\n' "${OPENAI_API_KEY}" >> .env
+          fi
+          echo "Wrote OPENAI_API_KEY to docker/.env (containers do not read shell exports)."
+          exit 0
+        fi
+        echo "OPENAI_API_KEY is not set in docker/.env and not exported in your shell."
+        echo "Add it to docker/.env, then run: task restart"
+        exit 1
+
+  restart-backend:
+    desc: "Recreate backend only (reload docker/.env; no UI restart)."
+    dir: "{{.DOCKER_DIR}}"
+    cmds:
+      - docker compose up -d --force-recreate backend
+      - task: verify-env
+
+  verify-env:
+    desc: "Check OPENAI_API_KEY inside the running backend container."
+    summary: |
+      Reads the container environment directly (use single quotes — do not echo $VAR
+      from your shell into docker exec, that only prints your host value).
+    dir: "{{.DOCKER_DIR}}"
+    cmds:
+      - |
+        docker exec mas-lab-backend-1 sh -c 'if [ -n "${OPENAI_API_KEY:-}" ]; then echo "OPENAI_API_KEY set in container (len=${#OPENAI_API_KEY})"; else echo "OPENAI_API_KEY empty — set it in docker/.env (not shell export) then: task restart"; exit 1; fi'
+
+  license:
+    desc: "Add SPDX Apache-2.0 headers to source files (dry-run by default)"
+    summary: |
+      Scans human-authored source under the repo and prints files that would change.
+      Canonical header:
+        Copyright (c) 2026 Cisco Systems, Inc. and its affiliates
+        SPDX-License-Identifier: Apache-2.0
+      Use task license:write to apply, task license:check for CI.
+    cmds:
+      - "{{.VENV}}/python scripts/apply_license_headers.py {{.CLI_ARGS}}"
+
+  license:write:
+    desc: "Apply SPDX license headers to all scanned source files"
+    cmds:
+      - "{{.VENV}}/python scripts/apply_license_headers.py --write {{.CLI_ARGS}}"
+
+  license:check:
+    desc: "Fail if any scanned file is missing or has a non-canonical license header"
+    cmds:
+      - "{{.VENV}}/python scripts/apply_license_headers.py --check {{.CLI_ARGS}}"
+
+  license:audit:
+    desc: "Report missing, incompatible, or duplicate SPDX headers"
+    cmds:
+      - "{{.VENV}}/python scripts/apply_license_headers.py --audit {{.CLI_ARGS}}"
+
+  demo-ui:
+    desc: "Run mas-lab serve (:8090) and the demo UI Vite app (:5174)"
+    summary: |
+      Starts the controller (data plane) and the golden-layout demo UI together.
+      Vite proxies /api and /ws to http://127.0.0.1:8090.
+      Open http://127.0.0.1:5174/ (gallery) or /#run-view.yaml
+      Extra paths discover a library's demo-ui/layouts (and src/ on PYTHONPATH):
+        task demo-ui -- /path/to/library
+        task demo-ui LIBRARY=/path/to/library
+        task demo-ui LAYOUTS=/path/to/library/demo-ui/layouts
+      Ctrl+C stops both processes.
+    deps: [install]
+    env:
+      VENV: "{{.VENV}}"
+      LIBRARY: '{{.LIBRARY | default ""}}'
+      DEMO_UI_LIBRARY: '{{.DEMO_UI_LIBRARY | default ""}}'
+      LAYOUTS: '{{.LAYOUTS | default ""}}'
+    cmds:
+      - bash scripts/demo-ui.sh {{.CLI_ARGS}}
+
+  demo-ui-export:
+    desc: "Build a static demo-ui replay from a native trace directory"
+    deps: [install]
+    cmds:
+      - |
+        TRACE='{{.TRACE}}'
+        OUT='{{.OUT | default "/tmp/replay"}}'
+        LAYOUT='{{.LAYOUT | default "run-view.yaml"}}'
+        if [ -z "$TRACE" ]; then
+          echo "usage: task demo-ui-export TRACE=~/.cache/mas/traces/<hash> [OUT=/tmp/replay] [LAYOUT=run-view.yaml]" >&2
+          exit 1
+        fi
+        {{.VENV}}/mas-lab demo-ui export "$TRACE" -o "$OUT" --layout "$LAYOUT" --serve
 
   docs-build:
     desc: "Build MkDocs site to site/ (same as Pages CI)."

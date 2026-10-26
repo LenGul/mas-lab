@@ -3,14 +3,11 @@
 import { Handle, Position, NodeResizer, type NodeProps } from "@xyflow/react";
 import { useCallback, type ChangeEvent } from "react";
 import type { OverlayDesignPatternNodeType } from "../types";
-
-const PATTERN_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: "react", label: "ReAct" },
-  { value: "cot", label: "Chain of Thought" },
-  { value: "reflection", label: "Reflection" },
-];
+import { useDesignPatternChoices } from "@/api/choices";
 
 export function OverlayDesignPatternNode({ data, id, selected }: NodeProps<OverlayDesignPatternNodeType>) {
+  const { groups } = useDesignPatternChoices();
+
   const handleChange = useCallback(
     (field: string) => (e: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
       data.onChange?.(
@@ -44,10 +41,14 @@ export function OverlayDesignPatternNode({ data, id, selected }: NodeProps<Overl
             onChange={handleChange("type")}
           >
             <option value="">Select pattern...</option>
-            {PATTERN_OPTIONS.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
+            {groups.map((group) => (
+              <optgroup key={group.label} label={group.label}>
+                {group.options.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </optgroup>
             ))}
           </select>
         </label>

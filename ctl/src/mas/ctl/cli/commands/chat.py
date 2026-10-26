@@ -13,6 +13,7 @@ from mas.ctl.cli.help_text import CHAT_EPILOG
 from mas.ctl.cli.obs_flags import observability_options, resolve_observability_config
 from mas.ctl.cli.trace_flags import mas_ctl_from_configs, resolve_trace_settings, trace_options
 from mas.ctl.session.bootstrap import InstantiationOptions, instantiate_runtime
+from mas.ctl.session.manifest_config import require_agent_id_from_manifest
 from mas.ctl.session.controller import (
     ConversationConfig,
     SessionController,
@@ -50,7 +51,7 @@ from mas.runtime.spec.checkpoint import parse_checkpoint_policy
     "--override",
     "overrides",
     multiple=True,
-    metavar="ROOT:PATH=VALUE",
+    metavar="PATH=VALUE",
     help="Schema-validated overlay override (repeatable; applied last).",
 )
 @bind_option
@@ -104,6 +105,12 @@ from mas.runtime.spec.checkpoint import parse_checkpoint_policy
     "--cache-write/--no-cache-write",
     default=None,
     help="Persist a response to the cache after calling the LLM (default: RuntimeEngine cache.write, else true)",
+)
+@click.option(
+    "--cache-read-only",
+    is_flag=True,
+    help="Answer only from the recorded answers: never call the LLM, never write the cache, "
+    "fail at once on an unrecorded prompt. Needs no API key.",
 )
 @click.option(
     "--stream/--no-stream",
@@ -163,6 +170,7 @@ def chat_cmd(
     no_validate: bool,
     cache_read: bool | None,
     cache_write: bool | None,
+    cache_read_only: bool,
     stream: bool | None,
     without_obs: bool,
     without_gov: bool,
@@ -190,6 +198,8 @@ def chat_cmd(
     from mas.ctl.session.infra_resolve import resolve_session_infra
     from mas.ctl.workspace.config import UserConfig, WorkspaceConfig
 
+    if cache_read_only and (cache_write or cache_read is False):
+        raise click.UsageError("--cache-read-only cannot be combined with --cache-write or --no-cache-read")
     overrides = with_binds(binds, (*max_tokens_overrides(max_tokens), *overrides))
     verbose = int(ctx.obj.get("verbose", 0) if ctx.obj else 0)
 
@@ -201,6 +211,8 @@ def chat_cmd(
         load_dotenv(cwd=session.original_cwd, manifest_dir=session.manifest_dir)
         workspace = WorkspaceConfig.load(session.manifest_dir or session.original_cwd)
         workspace = workspace.with_cli_overrides(overrides)
+        if workspace.cache_read_only and cache_write is not True and cache_read is not False:
+            cache_read_only = True
         user = UserConfig.load()
         overlay_strs = tuple(str(p) for p in session.overlays)
         agent_data, plugin = load_merged_agent_manifest(
@@ -359,6 +371,7 @@ def chat_cmd(
                     validate_manifests=not no_validate,
                     cache_read_override=cache_read,
                     cache_write_override=cache_write,
+                    cache_read_only=cache_read_only,
                     stream_override=stream,
                     hitl_contract=hitl_contract,
                     user_io_contract=user_io_contract,
@@ -393,7 +406,7 @@ def chat_cmd(
             events_file=events_file,
             events_stdout=events_stdout,
             events_format=events_format,
-            agent_id="agent",
+            agent_id=require_agent_id_from_manifest(agent_data),
             manifest=agent_data,
             flavour_spec=flavour_spec,
         )
@@ -417,9 +430,11 @@ def chat_cmd(
             # CLI-only run without explicit manifest: show "n/a" instead of generic "agent"
             agent_name = "n/a"
 
+        from mas.runtime.boundary.obs.exchange_hub import ExchangeHub
         from mas.runtime.driver.driver import engine_model_id
 
         llm_name = engine_model_id(getattr(instance.driver, "engine", None))
+        exchange_hub = ExchangeHub() if not no_control else None
 
         controller = SessionController(
             instance=instance,
@@ -431,6 +446,7 @@ def chat_cmd(
             obs_recorder=obs_rec,
             agent_id=agent_name,
             llm_id=llm_name,
+            exchange_hub=exchange_hub,
             config=ConversationConfig(
                 single_turn=single_turn or (bool(scripted) and not interactive),
                 save_checkpoint_each_turn=save_checkpoint,
@@ -459,6 +475,7 @@ def chat_cmd(
                     capability=ControlCapability(actor="admin", surface="admin")
                 ),
                 advertised,
+                hub=exchange_hub,
             )
             control_host.start(managed_session.session_id)
             display.on_system(

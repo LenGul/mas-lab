@@ -1,21 +1,25 @@
 //  Copyright (c) 2026 Cisco Systems, Inc. and its affiliates
 //  SPDX-License-Identifier: Apache-2.0
+/** Compatibility wrappers over the scope/item/run API. */
 import { useMutation, useQuery } from "@tanstack/react-query";
 
-declare global {
-  interface Window {
-    __MAS_LAB_API_BASE_URL__?: string;
-  }
-}
+import { API_BASE_URL, ApiError, apiJson } from "@/api/client";
+import { fetchChoices } from "@/api/choices";
+import {
+  createItem,
+  deleteItem,
+  fetchItem,
+  fetchItems,
+  updateItem,
+  validateInScope,
+} from "@/api/items";
+import { fetchArtifactBlob, fetchRunArtifacts, fetchArtifactText, type ArtifactNode } from "@/api/artifacts";
+import { deleteRun, fetchRun, fetchRuns, startRun } from "@/api/runs";
+import { toScopeId } from "@/api/scope";
+import { fetchScopeConfig, fetchScopes, pickDefaultScope } from "@/api/scopes";
+import { uploadFile } from "@/api/uploads";
 
-/** Runtime override (Docker entrypoint) → Vite build-time env → local dev default. */
-export const API_BASE_URL =
-  (typeof window !== "undefined" && window.__MAS_LAB_API_BASE_URL__) ||
-  import.meta.env.VITE_API_BASE_URL ||
-  import.meta.env.VITE_API_URL ||
-  "http://localhost:8090";
-
-// --- Libraries ---
+export { API_BASE_URL, ApiError };
 
 export interface Library {
   dir: string;
@@ -23,131 +27,99 @@ export interface Library {
   description: string;
 }
 
-async function fetchLibraries(): Promise<Library[]> {
-  const response = await fetch(`${API_BASE_URL}/api/libraries`);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch libraries: ${response.status}`);
-  }
-  const data = await response.json();
-  return data.libraries;
+export function pickLibrary(libraries: Library[] | undefined): string {
+  if (!libraries?.length) return "";
+  const scopes = libraries.map((lib) => ({
+    id: toScopeId(lib.dir),
+    name: lib.dir,
+    kind: "library" as const,
+    title: lib.name,
+    description: lib.description,
+    origin: "workspace",
+    writable: true,
+    kinds: [],
+  }));
+  return pickDefaultScope(scopes);
 }
 
 export function useLibraries() {
   return useQuery({
     queryKey: ["libraries"],
-    queryFn: fetchLibraries,
+    queryFn: async (): Promise<Library[]> => {
+      const scopes = await fetchScopes();
+      return scopes.map((s) => ({
+        dir: s.id,
+        name: s.title || s.name,
+        description: s.description,
+      }));
+    },
   });
 }
 
 export interface ValidateRequest {
   library: string;
-  manifest_yaml: string;
+  manifest_yaml?: string;
+  content?: string;
 }
 
-interface ValidateResponse {
-  exit_code: number;
-  stdout: string;
-  stderr: string;
-  command: string;
-}
-
-async function validateManifest(
-  request: ValidateRequest,
-): Promise<ValidateResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${request.library}/validate`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ manifest_yaml: request.manifest_yaml }),
-    },
-  );
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Validation failed with status ${response.status}`,
-    );
-  }
-
-  return response.json();
+async function validateManifest(request: ValidateRequest) {
+  const manifest = request.manifest_yaml ?? request.content ?? "";
+  const result = await validateInScope(toScopeId(request.library), { manifest });
+  return {
+    ...result,
+    stdout: result.valid ? "ok" : "",
+    message: result.valid ? "valid" : result.stderr,
+    status: result.valid ? "ok" : "error",
+  };
 }
 
 export function useValidateAgent() {
-  return useMutation({
-    mutationFn: validateManifest,
-  });
+  return useMutation({ mutationFn: validateManifest });
 }
 
 export function useValidateMas() {
-  return useMutation({
-    mutationFn: validateManifest,
-  });
+  return useMutation({ mutationFn: validateManifest });
 }
-
-// --- Tools ---
 
 export interface ToolOption {
   name: string;
   description: string;
 }
 
-async function fetchTools(
-  library: string,
-  namespaces: string[] = ["global"],
-): Promise<ToolOption[]> {
-  const params = new URLSearchParams({
-    namespaces: namespaces.join(","),
-  });
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${library}/tools?${params}`,
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to fetch tools: ${response.status}`);
-  }
-  const data = await response.json();
-  return data.tools;
-}
-
-export function useTools(library: string, namespaces: string[] = ["global"]) {
+export function useTools(library: string, _namespaces: string[] = ["global"]) {
   return useQuery({
-    queryKey: ["tools", library, ...namespaces],
-    queryFn: () => fetchTools(library, namespaces),
+    queryKey: ["tools", library],
+    queryFn: async (): Promise<ToolOption[]> => {
+      const data = await fetchChoices("tools", toScopeId(library));
+      const tools = (data.tools as Array<{ ref?: string; id: string; title?: string; summary?: string }>) ?? [];
+      return tools.map((t) => ({
+        name: t.ref || t.id,
+        description: t.summary || t.title || t.id,
+      }));
+    },
     enabled: !!library,
   });
 }
-
-// --- Skills ---
 
 export interface SkillOption {
   name: string;
   description: string;
 }
 
-async function fetchSkills(
-  library: string,
-  namespaces: string[] = ["global"],
-): Promise<SkillOption[]> {
-  const ns = namespaces.join(",");
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${library}/skills?namespaces=${encodeURIComponent(ns)}`,
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to fetch skills: ${response.status}`);
-  }
-  const data = await response.json();
-  return data.skills;
-}
-
-export function useSkills(library: string, namespaces: string[] = ["global"]) {
+export function useSkills(library: string, _namespaces: string[] = ["global"]) {
   return useQuery({
-    queryKey: ["skills", library, ...namespaces],
-    queryFn: () => fetchSkills(library, namespaces),
+    queryKey: ["skills", library],
+    queryFn: async (): Promise<SkillOption[]> => {
+      const data = await fetchChoices("skills", toScopeId(library));
+      const skills = (data.skills as Array<{ ref?: string; id: string; title?: string; summary?: string }>) ?? [];
+      return skills.map((t) => ({
+        name: t.ref || t.id,
+        description: t.summary || t.title || t.id,
+      }));
+    },
     enabled: !!library,
   });
 }
-
-// --- Run Agent ---
 
 export interface RunAgentRequest {
   library: string;
@@ -157,13 +129,6 @@ export interface RunAgentRequest {
   session_id?: string;
   verbose?: boolean;
   timeout?: number;
-}
-
-interface RunAgentSubmitResponse {
-  job_id: string;
-  status: string;
-  command: string;
-  session_id?: string;
 }
 
 export interface JobSubmitResponse {
@@ -182,7 +147,8 @@ export interface JobResponse {
     | "completed"
     | "failed"
     | "cancelled"
-    | "timeout";
+    | "timeout"
+    | "interrupted";
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -197,46 +163,47 @@ export interface JobResponse {
   session_id?: string;
 }
 
-export async function runAgent(
-  request: RunAgentRequest,
-): Promise<RunAgentSubmitResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${request.library}/run`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        manifest_yaml: request.manifest_yaml,
-        query: request.query,
-        ...(request.flavour && { flavour: request.flavour }),
-        ...(request.session_id && { session_id: request.session_id }),
-        verbose: request.verbose ?? false,
-        timeout: request.timeout ?? 60,
-      }),
-    },
-  );
+function runToJob(run: {
+  id: string;
+  status: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  exit_code?: number | null;
+  job_id?: string | null;
+  log?: string | null;
+}): JobResponse {
+  return {
+    id: run.id,
+    endpoint: "/api/runs",
+    command: "run",
+    status: (run.status === "interrupted" ? "failed" : run.status) as JobResponse["status"] || "pending",
+    created_at: run.started_at || "",
+    started_at: run.started_at ?? null,
+    finished_at: run.finished_at ?? null,
+    pid: null,
+    exit_code: run.exit_code ?? null,
+    stdout: run.log ?? "",
+    stderr: "",
+    error: null,
+  };
+}
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Run agent failed with status ${response.status}`,
-    );
-  }
-
-  return response.json();
+export async function runAgent(request: RunAgentRequest): Promise<{ job_id: string; status: string; command: string; session_id?: string }> {
+  const started = await startRun({
+    scope: toScopeId(request.library),
+    kind: "application",
+    item: "inline",
+    query: request.query,
+    manifest: request.manifest_yaml,
+  });
+  return { job_id: started.id, status: started.status, command: "run", session_id: request.session_id };
 }
 
 export interface JobSummary {
   id: string;
   endpoint: string;
   command: string;
-  status:
-    | "pending"
-    | "running"
-    | "completed"
-    | "failed"
-    | "cancelled"
-    | "timeout";
+  status: JobResponse["status"];
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -251,42 +218,23 @@ export interface JobDetail extends JobSummary {
   request_body?: Record<string, unknown>;
 }
 
-export async function fetchJobs(status?: string): Promise<JobSummary[]> {
-  const url = new URL(`${API_BASE_URL}/api/jobs`);
-  if (status) url.searchParams.set("status", status);
-  const response = await fetch(url.toString());
-  if (!response.ok) {
-    throw new Error(`Failed to fetch jobs: ${response.status}`);
-  }
-  const data = await response.json();
-  return data.jobs;
+export async function fetchJobs(_status?: string): Promise<JobSummary[]> {
+  const runs = await fetchRuns();
+  return runs.map((r) => runToJob(r));
 }
 
 export async function fetchJobDetail(jobId: string): Promise<JobDetail> {
-  const response = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(error?.detail ?? `Failed to fetch job ${jobId}`);
-  }
-  return response.json();
+  return runToJob(await fetchRun(jobId));
 }
 
 export async function pollJob(jobId: string): Promise<JobResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(error?.detail ?? `Failed to poll job ${jobId}`);
-  }
-
-  return response.json();
+  return runToJob(await fetchRun(jobId));
 }
-
-// --- Run MAS ---
 
 export interface RunMasRequest {
   library: string;
-  manifest_yaml: string;
+  manifest_yaml?: string;
+  item?: string;
   query: string;
   overlays?: string[];
   flavour?: string;
@@ -297,33 +245,16 @@ export interface RunMasRequest {
 export async function runMas(
   request: RunMasRequest,
 ): Promise<{ job_id: string; status: string; command: string }> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${request.library}/run-mas`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        manifest_yaml: request.manifest_yaml,
-        query: request.query,
-        overlays: request.overlays ?? [],
-        flavour: request.flavour,
-        verbose: request.verbose ?? true,
-        timeout: request.timeout ?? 600,
-      }),
-    },
-  );
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Run MAS failed with status ${response.status}`,
-    );
-  }
-
-  return response.json();
+  const started = await startRun({
+    scope: toScopeId(request.library),
+    kind: "application",
+    item: request.item ?? "inline",
+    query: request.query,
+    overlays: request.overlays,
+    manifest: request.item ? undefined : request.manifest_yaml,
+  });
+  return { job_id: started.id, status: started.status, command: "run" };
 }
-
-// --- Benchmark ---
 
 export interface BenchmarkRunRequest {
   library: string;
@@ -333,38 +264,37 @@ export interface BenchmarkRunRequest {
   timeout?: number;
 }
 
-interface BenchmarkRunSubmitResponse {
-  job_id: string;
-  status: string;
-  command: string;
+export async function runBenchmark(
+  request: BenchmarkRunRequest,
+): Promise<{ job_id: string; status: string; command: string }> {
+  const started = await startRun({
+    scope: toScopeId(request.library),
+    kind: "experiment",
+    item: "inline",
+    manifest: request.experiment_yaml,
+  });
+  return { job_id: started.id, status: started.status, command: "run" };
 }
 
-// --- MAS Resources ---
-
 export interface MasResourceEntry {
+  mas_name: string;
   mas_yaml: string;
-  agents: Record<string, string>;
+  agents?: Record<string, string>;
 }
 
 export interface MasResourceCreateRequest {
-  library: string;
   mas_name: string;
   mas_yaml: string;
   agents: Record<string, string>;
 }
 
 export interface MasResourceUpdateRequest {
-  library: string;
-  old_mas_name: string;
-  mas_name: string;
   mas_yaml: string;
   agents: Record<string, string>;
 }
 
 export interface MasResourceCreateResponse {
   mas_name: string;
-  path: string;
-  files: string[];
 }
 
 export interface MasResourceDetail {
@@ -376,14 +306,18 @@ export interface MasResourceDetail {
 export async function fetchMasResources(
   library: string,
 ): Promise<Record<string, MasResourceEntry>> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${library}/apps`,
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to fetch MAS resources: ${response.status}`);
+  const groups = await fetchItems(toScopeId(library), "application");
+  const result: Record<string, MasResourceEntry> = {};
+  for (const group of groups) {
+    const itemId = group.latest ? `${group.name}@${group.latest}` : group.items[0]?.id || group.name;
+    const detail = await fetchItem(toScopeId(library), "application", itemId);
+    result[detail.id] = {
+      mas_name: detail.id,
+      mas_yaml: detail.manifest,
+      agents: detail.children,
+    };
   }
-  const data = await response.json();
-  return data.mas_resources;
+  return result;
 }
 
 export function useMasResources(library: string) {
@@ -398,16 +332,8 @@ export async function fetchMasResourceDetail(
   library: string,
   masName: string,
 ): Promise<MasResourceDetail> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${library}/apps/${masName}`,
-  );
-  if (!response.ok) {
-    if (response.status === 404) {
-      throw new Error(`MAS resource "${masName}" not found`);
-    }
-    throw new Error(`Failed to fetch MAS resource: ${response.status}`);
-  }
-  return response.json();
+  const detail = await fetchItem(toScopeId(library), "application", masName);
+  return { mas_name: detail.id, mas_yaml: detail.manifest, agents: detail.children };
 }
 
 export function useMasResourceDetail(library: string, masName: string) {
@@ -419,200 +345,112 @@ export function useMasResourceDetail(library: string, masName: string) {
 }
 
 export async function createMasResource(
-  request: MasResourceCreateRequest,
+  request: MasResourceCreateRequest & { library: string },
 ): Promise<MasResourceCreateResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${request.library}/apps`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        mas_name: request.mas_name,
-        mas_yaml: request.mas_yaml,
-        agents: request.agents,
-      }),
-    },
-  );
-  if (!response.ok) {
-    if (response.status === 409) {
-      throw new Error(
-        `A MAS with the name "${request.mas_name}" already exists.`,
-      );
-    }
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to create MAS resource: ${response.status}`,
-    );
-  }
-  return response.json();
+  const created = await createItem(toScopeId(request.library), {
+    kind: "application",
+    name: request.mas_name,
+  });
+  await updateItem(toScopeId(request.library), "application", created.id, {
+    manifest: request.mas_yaml,
+    children: request.agents,
+    revision: created.revision,
+  });
+  return { mas_name: created.id };
 }
 
 export async function updateMasResource(
-  request: MasResourceUpdateRequest,
-): Promise<MasResourceCreateResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${request.library}/apps/${request.old_mas_name}`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        mas_name: request.mas_name,
-        mas_yaml: request.mas_yaml,
-        agents: request.agents,
-      }),
-    },
-  );
-  if (!response.ok) {
-    if (response.status === 404) {
-      throw new Error(`MAS resource "${request.old_mas_name}" not found.`);
-    }
-    if (response.status === 409) {
-      throw new Error(
-        `A MAS with the name "${request.mas_name}" already exists.`,
-      );
-    }
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to update MAS resource: ${response.status}`,
-    );
-  }
-  return response.json();
-}
-
-export async function deleteMasResource(
-  library: string,
-  masName: string,
+  request: MasResourceUpdateRequest & {
+    library: string;
+    mas_name: string;
+    old_mas_name?: string;
+  },
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${library}/apps/${masName}`,
-    { method: "DELETE" },
-  );
-  if (!response.ok && response.status !== 404) {
-    throw new Error(`Failed to delete MAS resource: ${response.status}`);
-  }
+  const itemId = request.old_mas_name || request.mas_name;
+  const current = await fetchItem(toScopeId(request.library), "application", itemId);
+  await updateItem(toScopeId(request.library), "application", current.id, {
+    manifest: request.mas_yaml,
+    children: request.agents,
+    revision: current.revision,
+  });
 }
 
-// --- Benchmark ---
-
-export async function runBenchmark(
-  request: BenchmarkRunRequest,
-): Promise<BenchmarkRunSubmitResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${request.library}/benchmark/run`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        experiment_yaml: request.experiment_yaml,
-        progress: request.progress ?? true,
-        ...(request.n_runs != null && { max_runs: request.n_runs }),
-        timeout: request.timeout ?? 1800,
-      }),
-    },
-  );
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Benchmark run failed with status ${response.status}`,
-    );
-  }
-
-  return response.json();
+export async function deleteMasResource(library: string, masName: string): Promise<void> {
+  await deleteItem(toScopeId(library), "application", masName);
 }
-
-// --- Scenarios ---
 
 export interface ScenarioEntry {
   name: string;
-  path: string;
-}
-
-async function fetchScenarios(library: string): Promise<ScenarioEntry[]> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${library}/scenarios`,
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to fetch scenarios: ${response.status}`);
-  }
-  const data = await response.json();
-  return data.scenarios;
+  description?: string;
 }
 
 export function useScenarios(library: string) {
   return useQuery({
     queryKey: ["scenarios", library],
-    queryFn: () => fetchScenarios(library),
+    queryFn: async (): Promise<ScenarioEntry[]> => {
+      const groups = await fetchItems(toScopeId(library), "overlay");
+      return groups.map((g) => ({ name: g.name, description: g.summary }));
+    },
     enabled: !!library,
   });
 }
 
-// --- Datasets ---
-
 export interface DatasetEntry {
   name: string;
   path: string;
-}
-
-async function fetchDatasets(library: string): Promise<DatasetEntry[]> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${library}/datasets`,
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to fetch datasets: ${response.status}`);
-  }
-  const data = await response.json();
-  return data.datasets;
+  description?: string;
 }
 
 export function useDatasets(library: string) {
   return useQuery({
     queryKey: ["datasets", library],
-    queryFn: () => fetchDatasets(library),
+    queryFn: async (): Promise<DatasetEntry[]> => {
+      const groups = await fetchItems(toScopeId(library), "dataset");
+      return groups.map((g) => ({
+        name: g.name,
+        path: g.items[0]?.ref || g.name,
+        description: g.summary,
+      }));
+    },
     enabled: !!library,
   });
 }
 
-// --- Experiments CRUD ---
-
 export interface ExperimentSummary {
   name: string;
-  description: string;
-  version: string;
-  scenarios: string[];
-  dataset: string;
+  description?: string;
   library?: string;
-  path?: string;
+  n_runs?: number;
+  version?: string;
+  scenarios?: string[];
+  dataset?: string;
 }
 
-async function fetchAllExperiments(): Promise<ExperimentSummary[]> {
-  const response = await fetch(`${API_BASE_URL}/api/experiments/definitions`);
-  if (!response.ok) throw new Error("Failed to fetch experiments");
-  const data = await response.json();
-  return data.experiments ?? [];
-}
-
-async function fetchExperiments(library: string): Promise<ExperimentSummary[]> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/experiments`,
-  );
-  if (!response.ok) throw new Error("Failed to fetch experiments");
-  const data = await response.json();
-  return data.experiments ?? [];
-}
-
-/** All experiments across libraries (design-space, extensions, lifecycle-control, …). */
 export function useAllExperiments() {
   return useQuery({
     queryKey: ["experiments", "all"],
-    queryFn: fetchAllExperiments,
+    queryFn: async (): Promise<ExperimentSummary[]> => {
+      const scopes = await fetchScopes();
+      const out: ExperimentSummary[] = [];
+      for (const scope of scopes) {
+        if (!scope.kinds.includes("experiment")) continue;
+        const groups = await fetchItems(scope.id, "experiment");
+        for (const g of groups) {
+          out.push({ name: g.name, description: g.summary, library: scope.id });
+        }
+      }
+      return out;
+    },
   });
 }
 
 export function useExperiments(library: string) {
   return useQuery({
     queryKey: ["experiments", library],
-    queryFn: () => fetchExperiments(library),
+    queryFn: async (): Promise<ExperimentSummary[]> => {
+      const groups = await fetchItems(toScopeId(library), "experiment");
+      return groups.map((g) => ({ name: g.name, description: g.summary, library }));
+    },
     enabled: !!library,
   });
 }
@@ -626,21 +464,13 @@ export async function fetchExperimentContent(
   library: string,
   name: string,
 ): Promise<ExperimentContentResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/experiments/${encodeURIComponent(name)}`,
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to fetch experiment: ${response.status}`,
-    );
-  }
-  return response.json();
+  const detail = await fetchItem(toScopeId(library), "experiment", name);
+  return { name: detail.id, content: detail.manifest };
 }
 
 export function useExperimentContent(library: string, name: string) {
   return useQuery({
-    queryKey: ["experiment-content", library, name],
+    queryKey: ["experiments", library, name],
     queryFn: () => fetchExperimentContent(library, name),
     enabled: !!library && !!name,
   });
@@ -648,208 +478,201 @@ export function useExperimentContent(library: string, name: string) {
 
 export async function createExperiment(
   library: string,
-  payload: { name: string; content: string },
+  nameOrPayload: string | { name: string; content: string },
+  content?: string,
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/experiments`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error
-        ? JSON.stringify(error, null, 2)
-        : `Failed to create experiment: ${response.status}`,
-    );
-  }
+  const name = typeof nameOrPayload === "string" ? nameOrPayload : nameOrPayload.name;
+  const yaml = typeof nameOrPayload === "string" ? content ?? "" : nameOrPayload.content;
+  const created = await createItem(toScopeId(library), { kind: "experiment", name });
+  await updateItem(toScopeId(library), "experiment", created.id, {
+    manifest: yaml,
+    revision: created.revision,
+  });
 }
 
 export async function updateExperimentApi(
   library: string,
-  oldName: string,
-  payload: { name: string; content: string },
-): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/experiments/${encodeURIComponent(oldName)}`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error
-        ? JSON.stringify(error, null, 2)
-        : `Failed to update experiment: ${response.status}`,
-    );
-  }
-}
-
-export async function deleteExperimentApi(
-  library: string,
   name: string,
+  contentOrPayload: string | { name?: string; content: string },
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/experiments/${encodeURIComponent(name)}`,
-    { method: "DELETE" },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to delete experiment: ${response.status}`,
-    );
-  }
+  const yaml = typeof contentOrPayload === "string" ? contentOrPayload : contentOrPayload.content;
+  const current = await fetchItem(toScopeId(library), "experiment", name);
+  await updateItem(toScopeId(library), "experiment", current.id, {
+    manifest: yaml,
+    revision: current.revision,
+  });
 }
 
-// --- Experiment Cache ---
-
-export async function deleteExperimentCache(
-  experimentName: string,
-): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/experiments/${encodeURIComponent(experimentName)}`,
-    { method: "DELETE" },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to delete experiment cache: ${response.status}`,
-    );
-  }
+export async function deleteExperimentApi(library: string, name: string): Promise<void> {
+  await deleteItem(toScopeId(library), "experiment", name);
 }
 
-// --- Experiment Detail ---
+export async function deleteExperimentCache(_library: string, name: string): Promise<void> {
+  const runs = await fetchRuns();
+  await Promise.all(runs.filter((r) => r.item === name).map((r) => deleteRun(r.id)));
+}
 
 export interface FileTreeEntry {
   name: string;
-  type: "file" | "directory";
+  type: "file" | "dir" | "directory";
   children?: FileTreeEntry[];
+  size?: number;
+  artifact_id?: string;
 }
 
 export interface ExperimentDetail {
   name: string;
-  metadata: Record<string, unknown>;
-  tree: FileTreeEntry[];
+  tree?: FileTreeEntry[];
+  metadata?: Record<string, unknown>;
 }
 
-async function fetchExperimentDetail(
-  experimentName: string,
-): Promise<ExperimentDetail> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/experiments/${encodeURIComponent(experimentName)}`,
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to fetch experiment: ${response.status}`,
-    );
+function artifactToEntry(node: ArtifactNode): FileTreeEntry {
+  const isDir =
+    node.kind === "dir" ||
+    node.kind === "directory" ||
+    Boolean(node.children?.length);
+  return {
+    name: node.name,
+    type: isDir ? "directory" : "file",
+    size: node.size,
+    artifact_id: node.artifact_id,
+    children: node.children?.map(artifactToEntry),
+  };
+}
+
+export function findArtifactId(tree: FileTreeEntry[] | undefined, path: string): string | undefined {
+  if (!tree || !path) return undefined;
+  const parts = path.split("/").filter(Boolean);
+  let nodes = tree;
+  let found: FileTreeEntry | undefined;
+  for (const part of parts) {
+    found = nodes.find((n) => n.name === part);
+    if (!found) return undefined;
+    nodes = found.children ?? [];
   }
-  return response.json();
+  return found?.artifact_id;
 }
 
 export function useExperimentDetail(experimentName: string) {
-  return useQuery({
+  const query = useQuery({
     queryKey: ["experiment", experimentName],
-    queryFn: () => fetchExperimentDetail(experimentName),
+    queryFn: async (): Promise<ExperimentDetail> => {
+      const runs = (await fetchRuns()).filter((r) => r.item === experimentName);
+      const children = await Promise.all(
+        runs.map(async (run) => {
+          const artifacts = await fetchRunArtifacts(run.id);
+          return {
+            name: run.id,
+            type: "directory" as const,
+            children: artifacts.map(artifactToEntry),
+          };
+        }),
+      );
+      const latest = runs[0];
+      return {
+        name: experimentName,
+        tree: children,
+        metadata: latest
+          ? {
+              status: latest.status,
+              run_id: latest.id,
+              started_at: latest.started_at,
+              finished_at: latest.finished_at,
+            }
+          : {},
+      };
+    },
     enabled: !!experimentName,
+    refetchInterval: (q) => {
+      const status = q.state.data?.metadata?.status;
+      const s = typeof status === "string" ? status.toLowerCase() : "";
+      return s === "running" || s === "pending" || s === "in_progress" ? 1500 : 3000;
+    },
   });
+
+  const isRunning =
+    typeof query.data?.metadata?.status === "string" &&
+    ["running", "pending", "in_progress"].includes(
+      String(query.data.metadata.status).toLowerCase(),
+    );
+
+  return { ...query, isRunning };
 }
 
 export interface ExperimentFileResponse {
-  path: string;
   content: string;
+  media_type?: string;
 }
 
 export async function fetchExperimentFile(
-  experimentName: string,
-  filePath: string,
+  _experimentName: string,
+  artifactId: string,
 ): Promise<ExperimentFileResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/experiments/${encodeURIComponent(experimentName)}/file?path=${encodeURIComponent(filePath)}`,
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to fetch file: ${response.status}`,
-    );
-  }
-  return response.json();
+  return { content: await fetchArtifactText(artifactId) };
 }
 
-// --- Pipeline Step Types ---
-
 export interface PipelineStepTypeConfigField {
-  type: string;
-  required?: boolean;
+  type?: string;
   default?: unknown;
   description?: string;
+  required?: boolean;
   enum?: string[];
+  [key: string]: unknown;
 }
 
 export interface PipelineStepTypeEntry {
   type: string;
-  label: string;
-  description: string;
-  phase: string;
-  category: string;
-  requires?: string;
-  config: Record<string, PipelineStepTypeConfigField>;
+  phase?: string;
+  description?: string;
+  category?: string;
+  label?: string;
+  config?: Record<string, PipelineStepTypeConfigField>;
 }
 
 export interface PipelineStepTypesResponse {
-  step_types: PipelineStepTypeEntry[];
-  categories: { id: string; label: string; color: string }[];
-}
-
-async function fetchPipelineStepTypes(): Promise<PipelineStepTypesResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/pipeline-step-types`);
-  if (!response.ok) throw new Error("Failed to fetch pipeline step types");
-  return response.json();
+  step_types?: PipelineStepTypeEntry[];
+  categories?: Array<{ id: string; label?: string }>;
 }
 
 export function usePipelineStepTypes() {
   return useQuery({
-    queryKey: ["pipeline-step-types"],
-    queryFn: fetchPipelineStepTypes,
-    staleTime: 5 * 60 * 1000,
+    queryKey: ["choices", "step-types"],
+    queryFn: async (): Promise<PipelineStepTypesResponse> => {
+      const data = await fetchChoices("step-types");
+      return {
+        step_types: (data.step_types as PipelineStepTypeEntry[]) ?? [],
+        categories: (data.categories as Array<{ id: string; label?: string }>) ?? [],
+      };
+    },
   });
 }
-
-// --- Pipelines ---
 
 export interface PipelineStepSummary {
   name: string;
   type: string;
-  depends_on: string[];
 }
 
 export interface PipelineSummary {
-  filename: string;
   name: string;
-  description: string;
-  steps: PipelineStepSummary[];
-  experiment: string;
-}
-
-async function fetchPipelines(library: string): Promise<PipelineSummary[]> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/pipelines`,
-  );
-  if (!response.ok) throw new Error("Failed to fetch pipelines");
-  const data = await response.json();
-  return data.pipelines ?? [];
+  description?: string;
+  filename?: string;
+  ref?: string;
+  experiment?: string;
+  steps?: PipelineStepSummary[];
 }
 
 export function usePipelines(library: string) {
   return useQuery({
     queryKey: ["pipelines", library],
-    queryFn: () => fetchPipelines(library),
+    queryFn: async (): Promise<PipelineSummary[]> => {
+      const groups = await fetchItems(toScopeId(library), "pipeline");
+      return groups.map((g) => ({
+        name: g.name,
+        description: g.summary,
+        filename: g.name,
+        ref: g.items[0]?.ref || g.name,
+      }));
+    },
     enabled: !!library,
   });
 }
@@ -859,25 +682,14 @@ export interface PipelineDetail {
   content: string;
 }
 
-export async function fetchPipelineDetail(
-  library: string,
-  name: string,
-): Promise<PipelineDetail> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/pipelines/${encodeURIComponent(name)}`,
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to fetch pipeline: ${response.status}`,
-    );
-  }
-  return response.json();
+export async function fetchPipelineDetail(library: string, name: string): Promise<PipelineDetail> {
+  const detail = await fetchItem(toScopeId(library), "pipeline", name);
+  return { name: detail.id, content: detail.manifest };
 }
 
 export function usePipelineDetail(library: string, name: string) {
   return useQuery({
-    queryKey: ["pipeline", library, name],
+    queryKey: ["pipelines", library, name],
     queryFn: () => fetchPipelineDetail(library, name),
     enabled: !!library && !!name,
   });
@@ -885,121 +697,60 @@ export function usePipelineDetail(library: string, name: string) {
 
 export async function createPipeline(
   library: string,
-  payload: { name: string; content: string },
+  nameOrSpec: string | { name: string; content: string },
+  content?: string,
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/pipelines`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to create pipeline: ${response.status}`,
-    );
-  }
+  const name = typeof nameOrSpec === "string" ? nameOrSpec : nameOrSpec.name;
+  const yaml = typeof nameOrSpec === "string" ? content ?? "" : nameOrSpec.content;
+  const created = await createItem(toScopeId(library), { kind: "pipeline", name });
+  await updateItem(toScopeId(library), "pipeline", created.id, {
+    manifest: yaml,
+    revision: created.revision,
+  });
 }
 
 export async function updatePipeline(
   library: string,
-  oldName: string,
-  payload: { name: string; content: string },
-): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/pipelines/${encodeURIComponent(oldName)}`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to update pipeline: ${response.status}`,
-    );
-  }
-}
-
-export async function deletePipeline(
-  library: string,
   name: string,
+  contentOrSpec: string | { name?: string; content: string },
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/pipelines/${encodeURIComponent(name)}`,
-    { method: "DELETE" },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to delete pipeline: ${response.status}`,
-    );
-  }
-}
-
-interface ValidateOverlayResponse {
-  status: string;
-  errors: string[];
-}
-
-export function useValidateOverlay() {
-  return useMutation({
-    mutationFn: async ({
-      library,
-      manifest_yaml,
-    }: {
-      library: string;
-      manifest_yaml: string;
-    }): Promise<ValidateOverlayResponse> => {
-      const response = await fetch(
-        `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/overlays/validate`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ manifest_yaml }),
-        },
-      );
-      if (!response.ok) {
-        const error = await response.json().catch(() => null);
-        const detail = error?.detail;
-        const errors = error?.errors;
-        const msg = errors?.length
-          ? errors.join("\n")
-          : typeof detail === "string"
-            ? detail
-            : detail
-              ? JSON.stringify(detail, null, 2)
-              : "Validation failed";
-        throw new Error(msg);
-      }
-      return response.json();
-    },
+  const yaml = typeof contentOrSpec === "string" ? contentOrSpec : contentOrSpec.content;
+  const current = await fetchItem(toScopeId(library), "pipeline", name);
+  await updateItem(toScopeId(library), "pipeline", current.id, {
+    manifest: yaml,
+    revision: current.revision,
   });
 }
 
-// --- Overlay CRUD ---
+export async function deletePipeline(library: string, name: string): Promise<void> {
+  await deleteItem(toScopeId(library), "pipeline", name);
+}
+
+export function useValidateOverlay() {
+  return useMutation({ mutationFn: validateManifest });
+}
 
 export interface OverlayEntry {
   name: string;
   description?: string;
   namespace?: string;
   path?: string;
+  ref?: string;
+  ui_canvas?: boolean | string;
 }
 
-export async function fetchOverlays(
-  library: string,
-): Promise<OverlayEntry[]> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/overlays`,
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to fetch overlays: ${response.status}`);
-  }
-  const data = await response.json();
-  return data.overlays as OverlayEntry[];
+export async function fetchOverlays(library: string): Promise<OverlayEntry[]> {
+  const groups = await fetchItems(toScopeId(library), "overlay");
+  return groups.map((g) => {
+    const ref = g.items[0]?.ref || g.name;
+    return {
+      name: g.name,
+      description: g.summary,
+      path: ref,
+      ref,
+      ui_canvas: g.ui_canvas,
+    };
+  });
 }
 
 export function useOverlays(library: string) {
@@ -1015,25 +766,14 @@ export interface OverlayDetail {
   content: string;
 }
 
-export async function fetchOverlay(
-  library: string,
-  name: string,
-): Promise<OverlayDetail> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/overlays/${encodeURIComponent(name)}`,
-  );
-  if (!response.ok) {
-    if (response.status === 404) {
-      throw new Error(`Overlay "${name}" not found`);
-    }
-    throw new Error(`Failed to fetch overlay: ${response.status}`);
-  }
-  return response.json();
+export async function fetchOverlay(library: string, name: string): Promise<OverlayDetail> {
+  const detail = await fetchItem(toScopeId(library), "overlay", name);
+  return { name: detail.id, content: detail.manifest };
 }
 
 export function useOverlay(library: string, name: string) {
   return useQuery({
-    queryKey: ["overlay", library, name],
+    queryKey: ["overlays", library, name],
     queryFn: () => fetchOverlay(library, name),
     enabled: !!library && !!name,
   });
@@ -1041,145 +781,69 @@ export function useOverlay(library: string, name: string) {
 
 export async function createOverlay(
   library: string,
-  payload: { name: string; content: string; run_validation?: boolean },
+  nameOrSpec: string | { name: string; content: string; run_validation?: boolean },
+  content?: string,
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/overlays`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to create overlay: ${response.status}`,
-    );
-  }
+  const name = typeof nameOrSpec === "string" ? nameOrSpec : nameOrSpec.name;
+  const yaml = typeof nameOrSpec === "string" ? content ?? "" : nameOrSpec.content;
+  const created = await createItem(toScopeId(library), { kind: "overlay", name });
+  await updateItem(toScopeId(library), "overlay", created.id, {
+    manifest: yaml,
+    revision: created.revision,
+  });
 }
 
 export async function updateOverlay(
   library: string,
-  overlayName: string,
-  payload: { name: string; content: string; run_validation?: boolean },
+  name: string,
+  contentOrSpec: string | { name?: string; content: string; run_validation?: boolean },
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/overlays/${encodeURIComponent(overlayName)}`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to update overlay: ${response.status}`,
-    );
-  }
+  const yaml = typeof contentOrSpec === "string" ? contentOrSpec : contentOrSpec.content;
+  const current = await fetchItem(toScopeId(library), "overlay", name);
+  await updateItem(toScopeId(library), "overlay", current.id, {
+    manifest: yaml,
+    revision: current.revision,
+  });
 }
 
-export async function deleteOverlayApi(
-  library: string,
-  name: string,
-): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/overlays/${encodeURIComponent(name)}`,
-    { method: "DELETE" },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to delete overlay: ${response.status}`,
-    );
-  }
+export async function deleteOverlayApi(library: string, name: string): Promise<void> {
+  await deleteItem(toScopeId(library), "overlay", name);
 }
 
 export function useValidatePipeline() {
-  return useMutation({
-    mutationFn: async ({
-      library,
-      content,
-    }: {
-      library: string;
-      content: string;
-    }) => {
-      const response = await fetch(
-        `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/pipelines/validate`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ manifest_yaml: content }),
-        },
-      );
-      if (!response.ok) {
-        const error = await response.json().catch(() => null);
-        const detail = error?.detail;
-        const msg =
-          typeof detail === "string"
-            ? detail
-            : detail
-              ? JSON.stringify(detail, null, 2)
-              : "Validation failed";
-        throw new Error(msg);
-      }
-      return response.json();
-    },
-  });
+  return useMutation({ mutationFn: validateManifest });
 }
 
 export async function runPipeline(
   library: string,
-  payload: { pipeline_yaml: string; only?: string[]; timeout?: number },
-): Promise<{ job_id: string }> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/pipeline/run`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to run pipeline: ${response.status}`,
-    );
-  }
-  return response.json();
+  name: string,
+): Promise<{ job_id: string; status: string; command: string }> {
+  const started = await startRun({
+    scope: toScopeId(library),
+    kind: "pipeline",
+    item: name,
+  });
+  return { job_id: started.id, status: started.status, command: "run" };
 }
 
-// --- Metrics ---
-
 export function useEvalMetrics() {
-  return useQuery<Record<string, string>>({
+  return useQuery({
     queryKey: ["metrics", "eval"],
-    queryFn: async () => {
-      const response = await fetch(`${API_BASE_URL}/api/metrics/eval`);
-      if (!response.ok) throw new Error("Failed to fetch eval metrics");
-      return response.json();
-    },
+    queryFn: () => apiJson<Record<string, string>>("/api/metrics/eval"),
   });
 }
 
 export function useMceMetrics() {
-  return useQuery<Record<string, string>>({
+  return useQuery({
     queryKey: ["metrics", "mce"],
-    queryFn: async () => {
-      const response = await fetch(`${API_BASE_URL}/api/metrics/mce`);
-      if (!response.ok) throw new Error("Failed to fetch MCE metrics");
-      return response.json();
-    },
+    queryFn: () => apiJson<Record<string, string>>("/api/metrics/mce"),
   });
 }
 
-// --- Datasets CRUD ---
-
 export interface DatasetSummary {
   name: string;
-  path: string;
-  description: string;
+  description?: string;
+  path?: string;
 }
 
 export interface DatasetDetail {
@@ -1187,16 +851,9 @@ export interface DatasetDetail {
   content: string;
 }
 
-export async function fetchDatasetsList(
-  library: string,
-): Promise<DatasetSummary[]> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/datasets`,
-  );
-  if (!response.ok)
-    throw new Error(`Failed to fetch datasets: ${response.status}`);
-  const data = await response.json();
-  return data.datasets;
+export async function fetchDatasetsList(library: string): Promise<DatasetSummary[]> {
+  const groups = await fetchItems(toScopeId(library), "dataset");
+  return groups.map((g) => ({ name: g.name, description: g.summary }));
 }
 
 export function useDatasetsList(library: string) {
@@ -1207,49 +864,26 @@ export function useDatasetsList(library: string) {
   });
 }
 
-export async function fetchDatasetDetail(
-  library: string,
-  name: string,
-): Promise<DatasetDetail> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/datasets/${encodeURIComponent(name)}`,
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to fetch dataset: ${response.status}`,
-    );
-  }
-  return response.json();
+export async function fetchDatasetDetail(library: string, name: string): Promise<DatasetDetail> {
+  const detail = await fetchItem(toScopeId(library), "dataset", name);
+  return { name: detail.id, content: detail.manifest };
 }
 
 export function useDatasetDetail(library: string, name: string) {
   return useQuery({
-    queryKey: ["dataset", library, name],
+    queryKey: ["datasets", library, name],
     queryFn: () => fetchDatasetDetail(library, name),
     enabled: !!library && !!name,
   });
 }
 
-export async function deleteDataset(
-  library: string,
-  name: string,
-): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/datasets/${encodeURIComponent(name)}`,
-    { method: "DELETE" },
-  );
-  if (!response.ok && response.status !== 404) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Failed to delete dataset: ${response.status}`,
-    );
-  }
+export async function deleteDataset(library: string, name: string): Promise<void> {
+  await deleteItem(toScopeId(library), "dataset", name);
 }
 
 export interface UpdateDatasetPayload {
-  name: string;
   content: string;
+  name?: string;
 }
 
 export async function updateDataset(
@@ -1257,57 +891,35 @@ export async function updateDataset(
   currentName: string,
   payload: UpdateDatasetPayload,
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/datasets/${encodeURIComponent(currentName)}`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error
-        ? JSON.stringify(error, null, 2)
-        : `Failed to update dataset: ${response.status}`,
-    );
-  }
+  const current = await fetchItem(toScopeId(library), "dataset", currentName);
+  await updateItem(toScopeId(library), "dataset", current.id, {
+    manifest: payload.content,
+    revision: current.revision,
+  });
 }
 
 export function useUpdateDataset(library: string, currentName: string) {
   return useMutation({
-    mutationFn: (payload: UpdateDatasetPayload) =>
-      updateDataset(library, currentName, payload),
+    mutationFn: (payload: UpdateDatasetPayload) => updateDataset(library, currentName, payload),
   });
 }
 
 export async function createDatasetApi(
   library: string,
-  payload: UpdateDatasetPayload,
+  name: string,
+  content: string,
 ): Promise<void> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/datasets`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error
-        ? JSON.stringify(error, null, 2)
-        : `Failed to create dataset: ${response.status}`,
-    );
-  }
+  const created = await createItem(toScopeId(library), { kind: "dataset", name });
+  await updateItem(toScopeId(library), "dataset", created.id, {
+    manifest: content,
+    revision: created.revision,
+  });
 }
 
 export function useCreateDataset(library: string) {
   return useMutation({
-    mutationFn: (payload: UpdateDatasetPayload) =>
-      createDatasetApi(library, payload),
+    mutationFn: ({ name, content }: { name: string; content: string }) =>
+      createDatasetApi(library, name, content),
   });
 }
 
@@ -1317,172 +929,146 @@ export function useDeleteDataset(library: string, name: string) {
   });
 }
 
-// --- Config Files ---
-
 export type ConfigFiles = Record<string, Record<string, string>>;
-
-async function fetchConfigFiles(library: string): Promise<ConfigFiles> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/config-files`,
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to fetch config files: ${response.status}`);
-  }
-  return response.json();
-}
 
 export function useConfigFiles(library: string) {
   return useQuery({
     queryKey: ["config-files", library],
-    queryFn: () => fetchConfigFiles(library),
+    queryFn: (): Promise<ConfigFiles> => fetchScopeConfig(toScopeId(library)),
     enabled: !!library,
   });
 }
 
-// --- Runtime runners ---
-
 export interface RuntimeRunner {
   id: string;
-  label: string;
-}
-
-async function fetchRuntimeRunners(): Promise<RuntimeRunner[]> {
-  const response = await fetch(`${API_BASE_URL}/api/runtime-runners`);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch runtime runners: ${response.status}`);
-  }
-  const data = await response.json();
-  return data.runners ?? [];
+  name?: string;
+  description?: string;
 }
 
 export function useRuntimeRunners() {
   return useQuery({
-    queryKey: ["runtime-runners"],
-    queryFn: fetchRuntimeRunners,
-    staleTime: 5 * 60 * 1000,
+    queryKey: ["choices", "runners"],
+    queryFn: async () => {
+      const data = await fetchChoices("runners");
+      return (data.runners as RuntimeRunner[]) ?? [];
+    },
   });
 }
 
 export async function analyzeBenchmark(
   library: string,
-  payload: { benchmark_id: string; experiment_yaml?: string; timeout?: number },
+  name: string | { benchmark_id: string },
 ): Promise<JobSubmitResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/benchmark/analyze`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Benchmark analyze failed with status ${response.status}`,
-    );
-  }
-  return response.json();
+  const item = typeof name === "string" ? name : name.benchmark_id;
+  const started = await startRun({
+    scope: toScopeId(library),
+    kind: "experiment",
+    item,
+    action: "analyze",
+  });
+  return { job_id: started.id, status: started.status, command: "analyze" };
 }
 
 export interface BenchmarkExportRequest {
-  benchmark_id: string;
-  output?: string;
-  include_trace_cache?: boolean;
-  dry_run?: boolean;
-  timeout?: number;
+  library: string;
+  experiment: string;
 }
 
-export async function exportBenchmark(
-  library: string,
-  payload: BenchmarkExportRequest,
-): Promise<JobSubmitResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/benchmark/export`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Benchmark export failed with status ${response.status}`,
-    );
+async function waitForRun(id: string) {
+  let run = await fetchRun(id);
+  while (run.status === "pending" || run.status === "running") {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    run = await fetchRun(id);
   }
-  return response.json();
+  return run;
 }
 
-export async function downloadBenchmarkExport(
-  library: string,
-  benchmarkId: string,
-): Promise<void> {
-  const url = `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/benchmark/download?benchmark_id=${encodeURIComponent(benchmarkId)}`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Benchmark download failed with status ${response.status}`,
-    );
+function firstArtifactId(nodes: ArtifactNode[]): string | undefined {
+  for (const node of nodes) {
+    if (node.artifact_id && node.kind !== "directory") return node.artifact_id;
+    const nested = node.children ? firstArtifactId(node.children) : undefined;
+    if (nested) return nested;
   }
-  const blob = await response.blob();
-  const disposition = response.headers.get("content-disposition");
-  const filename =
-    disposition?.match(/filename="?([^"]+)"?/)?.[1] ?? `${benchmarkId}.tar.gz`;
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  return undefined;
+}
+
+export async function exportBenchmark(request: BenchmarkExportRequest): Promise<Blob> {
+  const started = await startRun({
+    scope: toScopeId(request.library),
+    kind: "experiment",
+    item: request.experiment,
+    action: "export",
+  });
+  const run = await waitForRun(started.id);
+  if (run.status !== "completed") {
+    throw new Error(run.log || `export ${run.status}`);
+  }
+  const arts = await fetchRunArtifacts(started.id);
+  const artifactId = firstArtifactId(arts);
+  if (!artifactId) {
+    throw new Error("export produced no downloadable artifact");
+  }
+  return fetchArtifactBlob(artifactId);
+}
+
+export async function downloadBenchmarkExport(library: string, name: string): Promise<void> {
+  const started = await startRun({
+    scope: toScopeId(library),
+    kind: "experiment",
+    item: name,
+    action: "export",
+  });
+  const run = await waitForRun(started.id);
+  if (run.status !== "completed") {
+    throw new Error(run.log || `export ${run.status}`);
+  }
+  const arts = await fetchRunArtifacts(started.id);
+  const artifactId = firstArtifactId(arts);
+  if (!artifactId) {
+    throw new Error("export produced no downloadable artifact");
+  }
+  const blob = await fetchArtifactBlob(artifactId);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${name}.tar.gz`;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 export interface BenchmarkImportRequest {
-  tarball: string;
-  output_dir?: string;
-  trace_cache_dir?: string;
-  dry_run?: boolean;
-  timeout?: number;
+  library: string;
+  upload_id: string;
 }
 
-export async function importBenchmark(
-  library: string,
-  payload: BenchmarkImportRequest,
-): Promise<JobSubmitResponse> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/benchmark/import`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Benchmark import failed with status ${response.status}`,
-    );
+export async function importBenchmark(request: BenchmarkImportRequest): Promise<void> {
+  const started = await startRun({
+    scope: toScopeId(request.library),
+    kind: "experiment",
+    item: request.upload_id,
+    action: "import",
+  });
+  const run = await waitForRun(started.id);
+  if (run.status !== "completed") {
+    throw new Error(run.log || `import ${run.status}`);
   }
-  return response.json();
 }
 
 export async function uploadImportBenchmark(
-  library: string,
-  file: File,
+  libraryOrFile: string | File,
+  file?: File,
 ): Promise<JobSubmitResponse> {
-  const formData = new FormData();
-  formData.append("file", file);
-  const response = await fetch(
-    `${API_BASE_URL}/api/libraries/${encodeURIComponent(library)}/benchmark/upload-import`,
-    {
-      method: "POST",
-      body: formData,
-    },
-  );
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      error?.detail ?? `Benchmark upload-import failed with status ${response.status}`,
-    );
+  const payload = file ?? (libraryOrFile instanceof File ? libraryOrFile : undefined);
+  const library = typeof libraryOrFile === "string" ? libraryOrFile : "";
+  if (!payload) {
+    throw new Error("no file to import");
   }
-  return response.json();
+  const uploaded = await uploadFile(payload);
+  const started = await startRun({
+    scope: toScopeId(library),
+    kind: "experiment",
+    item: uploaded.upload_id,
+    action: "import",
+  });
+  return { job_id: started.id, status: started.status, command: "import" };
 }

@@ -7,15 +7,8 @@ import {
   Box,
   CircularProgress,
   Stack,
-  TextField,
   Typography,
   useTheme,
-  Button,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogContentText,
-  DialogActions,
 } from "@mui/material";
 import { useNavigate, useParams } from "react-router";
 import { useEffect, useMemo, useState } from "react";
@@ -27,6 +20,16 @@ import {
 } from "@/api/apiCalls";
 import { useQueryClient } from "@tanstack/react-query";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { scopeHref, useScopeId } from "@/api/scope";
+import {
+  InputField,
+  Button,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  DialogContentText,
+} from "@open-ui-kit/core";
 
 interface YamlDatasetItem {
   id: string | number;
@@ -94,10 +97,8 @@ function editorContentToYaml(
 const Dataset = () => {
   const theme = useTheme();
   const navigate = useNavigate();
-  const { library = "", "*": wildcard } = useParams<{
-    library: string;
-    "*": string;
-  }>();
+  const library = useScopeId();
+  const { "*": wildcard } = useParams();
   const id = wildcard || undefined;
   const queryClient = useQueryClient();
 
@@ -169,7 +170,7 @@ const Dataset = () => {
       queryClient.removeQueries({ queryKey: ["datasets-list", library] });
       if (lastSavedName && lastSavedName !== (id ?? "")) {
         queryClient.removeQueries({ queryKey: ["dataset", library, id ?? ""] });
-        navigate(`/${library}/datasets/${lastSavedName}`, { replace: true });
+        navigate(scopeHref(library, `/datasets/${lastSavedName}`), { replace: true });
       } else {
         queryClient.removeQueries({ queryKey: ["dataset", library, id ?? ""] });
         setEditedContent(null);
@@ -192,7 +193,7 @@ const Dataset = () => {
     if (createMutation.isSuccess) {
       queryClient.removeQueries({ queryKey: ["datasets-list", library] });
       setSaveAlert({ severity: "success", message: "Dataset created successfully" });
-      navigate(`/${library}/datasets/${lastSavedName}`, { replace: true });
+      navigate(scopeHref(library, `/datasets/${lastSavedName}`), { replace: true });
     }
     if (createMutation.isError) {
       const err = createMutation.error;
@@ -208,7 +209,7 @@ const Dataset = () => {
   useEffect(() => {
     if (deleteMutation.isSuccess) {
       queryClient.removeQueries({ queryKey: ["datasets-list", library] });
-      navigate(`/${library}/datasets`, { replace: true });
+      navigate(scopeHref(library, "/datasets"), { replace: true });
     }
     if (deleteMutation.isError) {
       setDeleteDialogOpen(false);
@@ -247,7 +248,7 @@ const Dataset = () => {
         </Typography>
         <Button
           variant="primary"
-          onClick={() => navigate(`/${library}/datasets`)}
+          onClick={() => navigate(scopeHref(library, "/datasets"))}
         >
           Back to Datasets
         </Button>
@@ -313,16 +314,14 @@ const Dataset = () => {
       <Dialog open={saveDialogOpen} onClose={() => setSaveDialogOpen(false)}>
         <DialogTitle>Save Dataset</DialogTitle>
         <DialogContent sx={{ display: "flex", flexDirection: "column", gap: 2, mt: 1 }}>
-          <TextField
+          <InputField
             label="Name"
-            variant="standard"
             fullWidth
             value={saveName}
             onChange={(e) => setSaveName(e.target.value)}
           />
-          <TextField
+          <InputField
             label="Description"
-            variant="standard"
             fullWidth
             multiline
             minRows={2}
@@ -332,7 +331,7 @@ const Dataset = () => {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setSaveDialogOpen(false)}>Cancel</Button>
-          <Button variant="primary" onClick={handleSave} disabled={!saveName.trim()}>
+          <Button variant="gradient" onClick={handleSave} disabled={!saveName.trim()}>
             Save
           </Button>
         </DialogActions>

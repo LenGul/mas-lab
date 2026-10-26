@@ -68,7 +68,7 @@ them conflict with core workspace dependencies.  They are declared in
 task install-lab LAB=labs/extensions.lab
 ```
 
-Extended OTel/KG observability is **not** an OSS extra — see `mas-lab-internal`.
+OpenTelemetry export and knowledge-graph normalisation ship as separate libraries (`mas-library-telemetry`, `mas-library-kg`), not as extras of this package.
 
 ---
 
@@ -278,6 +278,8 @@ uv pip install mas-library-lab  # PyPI
 **Depends on:** `mas-lab`  
 
 **Python entry point `mas.lab.eval.plugins`:** this package advertises 1 discoverable item(s) so the runtime can load `lab.eval.plugins` without a hard-coded path.
+
+**Python entry point `mas.lab.ui.plots`:** this package advertises 1 discoverable item(s) so the runtime can load `lab.ui.plots` without a hard-coded path.
 
 **Python entry point `mas.runtime.manifest_libraries`:** this package advertises 1 discoverable item(s) so the runtime can load `runtime.manifest_libraries` without a hard-coded path.
 

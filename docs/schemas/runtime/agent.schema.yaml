@@ -36,7 +36,12 @@ properties:
     properties:
       name:
         type: string
-        description: "Agent ID — must match the workflow node id that references this agent."
+        minLength: 1
+        not:
+          pattern: "[/\\\\]"
+        description: >
+          Agent ID — must match the workflow node id that references this
+          agent. A filesystem path is not a name.
       description:
         type: string
         description: "Human-readable description of this agent."
@@ -175,6 +180,34 @@ properties:
                 default: []
                 items:
                   type: string
+            allOf:
+              - if:
+                  properties:
+                    type:
+                      enum: [summarising, summarizing]
+                  required: [type]
+                then:
+                  properties:
+                    params:
+                      $ref: "./fragments/context-manager-summarising-params.schema.yaml"
+              - if:
+                  properties:
+                    type:
+                      enum: [sliding-window, sliding_window]
+                  required: [type]
+                then:
+                  properties:
+                    params:
+                      $ref: "./fragments/context-manager-sliding-window-params.schema.yaml"
+              - if:
+                  properties:
+                    type:
+                      enum: [stack, full-history, full_history]
+                  required: [type]
+                then:
+                  properties:
+                    params:
+                      $ref: "./fragments/context-manager-stack-params.schema.yaml"
 
       assembler:
         description: >

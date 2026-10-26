@@ -2,48 +2,71 @@
 //  SPDX-License-Identifier: Apache-2.0
 import "@open-ui-kit/core/typography.css";
 import "@xyflow/react/dist/style.css";
-import { ThemeProvider } from "@open-ui-kit/core";
-import { ThemeProvider as MuiThemeProvider, useTheme } from "@mui/material/styles";
-import { BrowserRouter as Router } from "react-router";
+import { ThemeMode, ThemeProvider } from "@open-ui-kit/core";
+import { BrowserRouter as Router, useLocation, useNavigate } from "react-router";
 import { Box, CssBaseline } from "@mui/material";
 import { TopBar } from "@/components";
 import AppRoutes from "@/routes/routes.tsx";
+import { useEffect } from "react";
 
 import { QueryClientProvider } from "@/provider";
-import { GLOBAL_BACKGROUND_COLOR } from "@/common/styles";
-import { createLocalTheme } from "@/theme/theme";
+import { fetchApiInfo } from "@/api/info";
 
 function ThemedApp() {
-  const outerTheme = useTheme();
-  const localTheme = createLocalTheme(outerTheme);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const hideChrome = location.pathname === "/connect";
+
+  useEffect(() => {
+    const goConnect = () => {
+      if (location.pathname !== "/connect") navigate("/connect");
+    };
+    window.addEventListener("mas-lab:unauthorized", goConnect);
+    window.addEventListener("mas-lab:unreachable", goConnect);
+    return () => {
+      window.removeEventListener("mas-lab:unauthorized", goConnect);
+      window.removeEventListener("mas-lab:unreachable", goConnect);
+    };
+  }, [location.pathname, navigate]);
+
+  useEffect(() => {
+    if (location.pathname === "/connect") return;
+    let cancelled = false;
+    fetchApiInfo().catch(() => {
+      if (!cancelled) navigate("/connect");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [location.pathname, navigate]);
 
   return (
-    <MuiThemeProvider theme={localTheme}>
+    <>
       <CssBaseline />
-      <Router>
-        <Box
-          sx={{
-            height: "100%",
-            width: "100%",
-            display: "flex",
-            flexDirection: "column",
-          }}
-        >
-          <TopBar />
-          <Box sx={{ flex: 1, backgroundColor: GLOBAL_BACKGROUND_COLOR }}>
-            <AppRoutes />
-          </Box>
+      <Box
+        sx={{
+          height: "100%",
+          width: "100%",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        {!hideChrome && <TopBar />}
+        <Box sx={{ flex: 1 }}>
+          <AppRoutes />
         </Box>
-      </Router>
-    </MuiThemeProvider>
+      </Box>
+    </>
   );
 }
 
 const App = () => {
   return (
     <QueryClientProvider>
-      <ThemeProvider defaultDarkMode>
-        <ThemedApp />
+      <ThemeProvider defaultMode={ThemeMode.Midnight}>
+        <Router>
+          <ThemedApp />
+        </Router>
       </ThemeProvider>
     </QueryClientProvider>
   );

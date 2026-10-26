@@ -6,26 +6,23 @@ import {
   TabPanel,
   PipelineBuilder,
 } from "@/components";
-import {
-  Box,
-  Stack,
-  Typography,
-  useTheme,
-  Tabs,
-  Tab,
-  Button,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  TextField,
-  Alert,
-} from "@mui/material";
+import { Box, Stack, Typography, useTheme, Alert } from "@mui/material";
 import { useLocation, useNavigate, useParams } from "react-router";
 import { useCallback, useEffect, useState } from "react";
 import { useValidatePipeline, createPipeline } from "@/api/apiCalls";
 import { useQueryClient } from "@tanstack/react-query";
 import { parse, stringify } from "yaml";
+import { scopeHref, useScopeId } from "@/api/scope";
+import {
+  Button,
+  InputField,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Tab,
+  Tabs,
+} from "@open-ui-kit/core";
 
 const TAB_KEYS = ["graph", "yaml"] as const;
 type PipelineTab = (typeof TAB_KEYS)[number];
@@ -34,7 +31,8 @@ const CreatePipeline = () => {
   const theme = useTheme();
   const navigate = useNavigate();
   const location = useLocation();
-  const { library = "", pipelineTab } = useParams();
+  const library = useScopeId();
+  const { pipelineTab } = useParams();
   const queryClient = useQueryClient();
 
   const [pipelineYaml, setPipelineYaml] = useState("");
@@ -119,7 +117,7 @@ const CreatePipeline = () => {
       await createPipeline(library, { name: trimmedName, content: finalYaml });
       queryClient.invalidateQueries({ queryKey: ["pipelines", library] });
       handleCloseSaveDialog();
-      navigate(`/${library}/pipelines`);
+      navigate(scopeHref(library, "/pipelines"));
     } catch (err) {
       setSaveError(
         err instanceof Error ? err.message : "Failed to save pipeline.",
@@ -249,7 +247,7 @@ const CreatePipeline = () => {
                     color: theme.palette.warning.main,
                   }}
                 >
-                  pipeline.yaml
+                  pipeline
                 </Typography>
                 <CodeBlock code={pipelineYaml} language="yaml" />
               </Box>
@@ -271,37 +269,35 @@ const CreatePipeline = () => {
               {saveError}
             </Alert>
           )}
-          <TextField
-            autoFocus
-            margin="dense"
-            label="Pipeline Name"
-            placeholder="Enter a name for the pipeline"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            value={pipelineName}
-            onChange={(e) => {
-              setPipelineName(e.target.value);
-              setSaveError("");
-            }}
-          />
-          <TextField
-            margin="dense"
-            label="Description"
-            placeholder="Optional description for the pipeline"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            multiline
-            minRows={2}
-            maxRows={4}
-            value={pipelineDescription}
-            onChange={(e) => setPipelineDescription(e.target.value)}
-          />
+          <Stack direction="column" sx={{ gap: "16px" }}>
+            <InputField
+              autoFocus
+              label="Pipeline Name"
+              placeholder="Enter a name for the pipeline"
+              autoComplete="off"
+              fullWidth
+              value={pipelineName}
+              onChange={(e) => {
+                setPipelineName(e.target.value);
+                setSaveError("");
+              }}
+            />
+            <InputField
+              label="Description"
+              placeholder="Optional description for the pipeline"
+              autoComplete="off"
+              fullWidth
+              multiline
+              minRows={2}
+              maxRows={4}
+              value={pipelineDescription}
+              onChange={(e) => setPipelineDescription(e.target.value)}
+            />
+          </Stack>
         </DialogContent>
         <DialogActions>
           <Button onClick={handleCloseSaveDialog}>Cancel</Button>
-          <Button variant="primary" onClick={handleSave} disabled={isSaving}>
+          <Button variant="gradient" onClick={handleSave} disabled={isSaving}>
             {isSaving ? "Saving..." : "Save"}
           </Button>
         </DialogActions>

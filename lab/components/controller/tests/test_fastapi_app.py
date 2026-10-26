@@ -82,6 +82,31 @@ def test_tools_and_skills(client):
     assert "global/answer-formatting" in skill_names
 
 
+def test_read_library_document(client):
+    data = client.get(
+        "/api/libraries/demo/documents",
+        params={"path": "apps/trip-planner/mas.yaml"},
+    ).json()
+    assert "workflow:" in data["content"]
+    assert data["path"] == "apps/trip-planner/mas.yaml"
+
+
+def test_read_library_document_rejects_escape(client):
+    resp = client.get(
+        "/api/libraries/demo/documents",
+        params={"path": "../outside.yaml"},
+    )
+    assert resp.status_code == 400
+
+
+def test_read_library_document_missing(client):
+    resp = client.get(
+        "/api/libraries/demo/documents",
+        params={"path": "no-such.yaml"},
+    )
+    assert resp.status_code == 404
+
+
 # -- Experiments CRUD ---------------------------------------------------------
 
 def test_experiments_crud(client, demo_lab):
@@ -184,6 +209,87 @@ def test_mas_resources(client, demo_lab):
     client.delete("/api/libraries/demo/apps/renamed-mas")
 
 
+def test_mas_canvas_persists_to_ui_canvas_overlay(client, demo_lab):
+    mas_yaml = "\n".join(
+        [
+            "apiVersion: mas/v1",
+            "kind: MAS",
+            "metadata:",
+            "  name: canvas-app",
+            "spec:",
+            "  agency:",
+            "    agents:",
+            "      - id: coordinator",
+            "        ref: agents/coordinator.yaml",
+            "  workflow:",
+            "    entry: coordinator",
+            "    nodes:",
+            "      - id: coordinator",
+            "        role: specialist",
+            "x-canvas-positions:",
+            "  coordinator: {x: 10, y: 20}",
+            "",
+        ]
+    )
+    agents = {
+        "coordinator": "\n".join(
+            [
+                "apiVersion: mas/v1",
+                "kind: Agent",
+                "metadata:",
+                "  name: coordinator",
+                "  x-node-id: node_coord",
+                "spec:",
+                "  x-text-input: hello",
+                "",
+            ]
+        )
+    }
+    resp = client.post(
+        "/api/libraries/demo/apps",
+        json={"mas_name": "canvas-app", "mas_yaml": mas_yaml, "agents": agents},
+    )
+    assert resp.status_code == 201
+    app_dir = demo_lab / "apps" / "canvas-app"
+    on_disk = (app_dir / "mas.yaml").read_text(encoding="utf-8")
+    assert "x-canvas-positions" not in on_disk
+    overlay_path = app_dir / "overlays" / "canvas-app.yaml"
+    assert overlay_path.is_file()
+    overlay_text = overlay_path.read_text(encoding="utf-8")
+    assert "kind: Overlay" in overlay_text
+    assert "name: canvas-app" in overlay_text
+    assert "x-canvas-positions" in overlay_text
+    assert "x-ui-canvas" not in overlay_text
+
+    listed = client.get("/api/libraries/demo/overlays").json()["overlays"]
+    canvas_rows = [
+        o
+        for o in listed
+        if o["name"] == "canvas-app" and str(o.get("path", "")).endswith("overlays/canvas-app.yaml")
+    ]
+    assert canvas_rows
+    assert canvas_rows[0]["ui_canvas"] is True
+
+    detail = client.get("/api/libraries/demo/apps/canvas-app").json()
+    assert "x-canvas-positions" in detail["mas_yaml"]
+    assert detail["ui_canvas_overlay"].endswith("overlays/canvas-app.yaml")
+    assert "hello" in detail["agents"]["coordinator"]
+
+    # Unparseable agent YAML must not drop the agent on save.
+    resp = client.put(
+        "/api/libraries/demo/apps/canvas-app",
+        json={
+            "mas_name": "canvas-app",
+            "mas_yaml": mas_yaml,
+            "agents": {"coordinator": "spec: [\n"},
+        },
+    )
+    assert resp.status_code == 200
+    saved_agent = (app_dir / "agents" / "coordinator.yaml").read_text(encoding="utf-8")
+    assert saved_agent == "spec: [\n"
+
+
+
 # -- Pipeline step types ------------------------------------------------------
 
 def test_pipeline_step_types(client):
@@ -202,10 +308,73 @@ def test_metrics_endpoints(client):
 # -- Jobs ---------------------------------------------------------------------
 
 def test_jobs_list_empty(client):
+    from mas.lab.controller import api as api_mod
     from mas.lab.controller import jobs
 
     jobs._jobs.clear()
+    api_mod._INSTANCE = None
     assert client.get("/api/jobs").json()["jobs"] == []
+
+
+def test_experiment_run_starts_controller_worker(client, monkeypatch):
+    submitted: dict = {}
+
+    class _FakeAPI:
+        def submit_experiment(self, spec):
+            submitted.update(spec)
+            return {"worker_id": "w-exp-1", "job_id": "w-exp-1", "status": "pending"}
+
+    monkeypatch.setattr(
+        "mas.lab.controller.routes.experiments.get_controller_api",
+        lambda workspace=None: _FakeAPI(),
+    )
+    resp = client.post(
+        "/api/libraries/demo/experiment/run",
+        json={
+            "experiment_yaml": "trip-planner-design-pattern-experiment.yaml",
+            "query": "hello",
+            "demo_ui_ingest_url": "http://127.0.0.1:8765/api/ingest",
+        },
+    )
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["job_id"] == "w-exp-1"
+    assert submitted["progress"] is False
+    assert submitted["live"] is True
+    assert submitted["experiment_yaml"].endswith("trip-planner-design-pattern-experiment.yaml")
+
+
+def test_jobs_origin_filter_and_delete(client):
+    from mas.lab.controller import api as api_mod
+    from mas.lab.controller import jobs
+    from mas.lab.controller.jobs import Job, JobStatus, now_iso
+
+    jobs._jobs.clear()
+    api_mod._INSTANCE = None
+    ui = Job(
+        id="ui-1",
+        endpoint="/x",
+        command="x",
+        status=JobStatus.FAILED,
+        created_at=now_iso(),
+        request_body={"demo_ui_ref": {"origin": "demo-ui"}},
+    )
+    other = Job(
+        id="cli-1",
+        endpoint="/x",
+        command="x",
+        status=JobStatus.FAILED,
+        created_at=now_iso(),
+    )
+    jobs._jobs[ui.id] = ui
+    jobs._jobs[other.id] = other
+    listed = client.get("/api/jobs", params={"origin": "demo-ui"}).json()["jobs"]
+    assert [item["id"] for item in listed] == ["ui-1"]
+    assert client.delete("/api/jobs", params={"origin": "demo-ui"}).json()["removed"] >= 1
+    assert "ui-1" not in jobs._jobs
+    assert "cli-1" in jobs._jobs
+    assert client.delete("/api/jobs/cli-1").status_code == 200
+    assert "cli-1" not in jobs._jobs
 
 
 # -- Config files -------------------------------------------------------------

@@ -27,6 +27,7 @@ from mas.runtime.schema.ingress import (
 
 if TYPE_CHECKING:
     from mas.runtime.boundary.obs.binding import ObservabilityBinding
+    from mas.runtime.boundary.obs.plugins import ObsPluginSet
 
 
 @dataclass
@@ -36,13 +37,61 @@ class RuntimeInstance:
     kernel: RuntimeKernel
     driver: KernelDriver
     _checkpoints: list[dict] = field(default_factory=list)
-    obs_plugin_set: Any | None = field(default=None, repr=False)
+    obs_plugin_set: ObsPluginSet | None = field(default=None, repr=False)
     # Mirrors spec.working_memory on the agent manifest (default:
     # persistent=True). Set by instantiate_runtime() from the agent
     # manifest; only consulted on the delegation path (make_workflow_send) —
     # an entry agent driven directly by the user already keeps its own
     # history for free across turns. See WorkingMemoryConfig.
     working_memory: WorkingMemoryConfig = field(default_factory=WorkingMemoryConfig)
+    # Counts executions per ``<agent>-<turn>`` so reused turn ids stay unique.
+    _exec_id_uses: dict[str, int] = field(default_factory=dict, repr=False)
+
+    def _execution_id(self, agent_id: str, turn_id: str) -> str:
+        """``<agent>-<turn>-exec``, with ``-<n>`` after the first use of that pair."""
+        base = f"{agent_id}-{turn_id}" if agent_id else str(turn_id)
+        n = self._exec_id_uses.get(base, 0) + 1
+        self._exec_id_uses[base] = n
+        return f"{base}-exec" if n == 1 else f"{base}-{n}-exec"
+
+    def _begin_user_turn(self, text: str, turn_id: str, parent_call_id: str) -> str | None:
+        op = self.driver.observability
+        if op is None or self.obs_plugin_set is None:
+            return None
+        exec_id = self._execution_id(op._agent_id, turn_id)
+        op.push_call_frame(exec_id)
+        rec: dict[str, Any] = {"text": text, "call_id": exec_id, "turn_id": turn_id}
+        if parent_call_id:
+            rec["parent_call_id"] = parent_call_id
+        op.record_session("user_input", **rec)
+        return exec_id
+
+    def _finish_user_turn(self, exec_id: str | None, trace: DriverTrace) -> None:
+        op = self.driver.observability
+        if op is None or exec_id is None:
+            return
+        response_text = "\n".join(
+            r.content for r in trace.client_responses if getattr(r, "content", "")
+        ).strip()
+        if response_text:
+            op.record_session("agent_response", text=response_text, finish_reason="stop")
+        op.pop_call_frame(exec_id)
+
+    def _user_input_event(
+        self,
+        text: str,
+        turn_id: str,
+        session_id: str,
+        upstream_correlation_id: int | None,
+    ) -> UserInputReceived:
+        kwargs: dict[str, Any] = {
+            "user_turn_id": turn_id,
+            "text": text,
+            "upstream_correlation_id": upstream_correlation_id,
+        }
+        if session_id:
+            kwargs["session_id"] = session_id
+        return UserInputReceived(**kwargs)
 
     @classmethod
     def from_parts(
@@ -83,7 +132,7 @@ class RuntimeInstance:
             plugin_set = ObsPluginSet(plugins=plugins)
             plugin_set.subscribe_to(
                 op,
-                agent_id=obs_agent_id or "agent",
+                agent_id=obs_agent_id or "",
             )
             instance.obs_plugin_set = plugin_set
 
@@ -95,7 +144,8 @@ class RuntimeInstance:
         spec: dict,
         *,
         base_dir: Any | None = None,
-        agent_id: str = "agent",
+        agent_id: str = "",
+        mas_id: str = "",
         obs_binding_override: ObservabilityBinding | None = None,
         hitl: Any | None = None,
         engine: Any | None = None,
@@ -125,6 +175,8 @@ class RuntimeInstance:
             manifest_dir=resolved_base_dir,
         )
         obs_binding = obs_binding_override if obs_binding_override is not None else spec_obs_binding
+        if obs_binding is not None and mas_id:
+            obs_binding = obs_binding.with_mas_id(mas_id)
 
         if not enable_governance:
             kernel_config = _replace(kernel_config, enable_governance=False)
@@ -169,35 +221,11 @@ class RuntimeInstance:
         instead of starting a new one; that's the caller's job, not this
         method's — it never mints one, only forwards or omits.
         """
-        op = self.driver.observability
-        exec_id: str | None = None
-        if op is not None and self.obs_plugin_set is not None:
-            agent_id = op._agent_id or "agent"
-            exec_id = f"{agent_id}-{turn_id}-exec"
-            op.push_call_frame(exec_id)
-            record_kwargs = {"text": text, "call_id": exec_id, "turn_id": turn_id}
-            if parent_call_id:
-                # This turn is a delegated sub-agent call — parent to the
-                # delegating tool call itself, not the top-level MAS call
-                # (the transform layer's fallback when this isn't given).
-                record_kwargs["parent_call_id"] = parent_call_id
-            op.record_session("user_input", **record_kwargs)
-
-        ingress_kwargs: dict[str, Any] = {
-            "user_turn_id": turn_id,
-            "text": text,
-            "upstream_correlation_id": upstream_correlation_id,
-        }
-        if session_id:
-            ingress_kwargs["session_id"] = session_id
-        trace = self.feed(UserInputReceived(**ingress_kwargs))
-
-        if op is not None and exec_id is not None:
-            response_text = "\n".join(r.content for r in trace.client_responses if getattr(r, "content", "")).strip()
-            if response_text:
-                op.record_session("agent_response", text=response_text, finish_reason="stop")
-            op.pop_call_frame(exec_id)
-
+        exec_id = self._begin_user_turn(text, turn_id, parent_call_id)
+        trace = self.feed(
+            self._user_input_event(text, turn_id, session_id, upstream_correlation_id)
+        )
+        self._finish_user_turn(exec_id, trace)
         return trace
 
     async def afeed(self, event: IngressSymbol) -> DriverTrace:
@@ -213,32 +241,11 @@ class RuntimeInstance:
         upstream_correlation_id: int | None = None,
     ) -> DriverTrace:
         """Async twin of :meth:`run_user_text` — awaits ``driver.afeed``."""
-        op = self.driver.observability
-        exec_id: str | None = None
-        if op is not None and self.obs_plugin_set is not None:
-            agent_id = op._agent_id or "agent"
-            exec_id = f"{agent_id}-{turn_id}-exec"
-            op.push_call_frame(exec_id)
-            record_kwargs = {"text": text, "call_id": exec_id, "turn_id": turn_id}
-            if parent_call_id:
-                record_kwargs["parent_call_id"] = parent_call_id
-            op.record_session("user_input", **record_kwargs)
-
-        ingress_kwargs: dict[str, Any] = {
-            "user_turn_id": turn_id,
-            "text": text,
-            "upstream_correlation_id": upstream_correlation_id,
-        }
-        if session_id:
-            ingress_kwargs["session_id"] = session_id
-        trace = await self.afeed(UserInputReceived(**ingress_kwargs))
-
-        if op is not None and exec_id is not None:
-            response_text = "\n".join(r.content for r in trace.client_responses if getattr(r, "content", "")).strip()
-            if response_text:
-                op.record_session("agent_response", text=response_text, finish_reason="stop")
-            op.pop_call_frame(exec_id)
-
+        exec_id = self._begin_user_turn(text, turn_id, parent_call_id)
+        trace = await self.afeed(
+            self._user_input_event(text, turn_id, session_id, upstream_correlation_id)
+        )
+        self._finish_user_turn(exec_id, trace)
         return trace
 
     def capture_session_baseline(self) -> None:

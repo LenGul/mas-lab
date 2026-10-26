@@ -26,23 +26,27 @@ import {
   Typography,
   useTheme,
 } from "@mui/material";
-import { useNavigate, useParams } from "react-router";
+import { useNavigate } from "react-router";
+import { useScopeId, scopeHref } from "@/api/scope";
 import { useCallback, useMemo, useState } from "react";
 import { useDatasetsList, deleteDataset } from "@/api/apiCalls";
 import type { DatasetSummary } from "@/api/apiCalls";
 import { useQueryClient } from "@tanstack/react-query";
-import { GLOBAL_BACKGROUND_COLOR } from "@/common/styles";
+import { CreateItemDialog } from "@/components/CreateItemDialog";
+
+const TABLE_BG = "transparent";
 
 type DatasetColumnDefs = TableProps<DatasetSummary>["columns"];
 
 const Datasets = () => {
   const theme = useTheme();
   const navigate = useNavigate();
-  const { library = "" } = useParams<{ library: string }>();
+  const library = useScopeId();
   const queryClient = useQueryClient();
 
   const { data: datasets, isLoading } = useDatasetsList(library);
 
+  const [createOpen, setCreateOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [pendingDeleteNames, setPendingDeleteNames] = useState<string[]>([]);
   const [rowSelection, setRowSelection] = useState<MRT_RowSelectionState>({});
@@ -50,10 +54,7 @@ const Datasets = () => {
     { id: "name", desc: false },
   ]);
 
-  const rows = useMemo<DatasetSummary[]>(
-    () => (datasets ?? []).filter((d) => d.name.endsWith(".yaml") || d.name.endsWith(".yml")),
-    [datasets],
-  );
+  const rows = useMemo<DatasetSummary[]>(() => datasets ?? [], [datasets]);
 
   const handleRequestDelete = useCallback((names: string[]) => {
     setPendingDeleteNames(names);
@@ -81,28 +82,25 @@ const Datasets = () => {
         accessorKey: "name",
         header: "Name",
         size: 300,
-        accessorFn: (row) => {
-          const relPath = (row.path || row.name).replace(/^datasets\//, "");
-          return (
-            <Tooltip title={relPath} placement="top">
-              <Typography
-                variant="body2"
-                sx={{
-                  cursor: "pointer",
-                  "&:hover": { textDecoration: "underline" },
-                  textOverflow: "ellipsis",
-                  overflow: "hidden",
-                  whiteSpace: "nowrap",
-                }}
-                onClick={() =>
-                  navigate(`/${library}/datasets/${relPath}`)
-                }
-              >
-                {relPath}
-              </Typography>
-            </Tooltip>
-          );
-        },
+        accessorFn: (row) => (
+          <Tooltip title={row.name} placement="top">
+            <Typography
+              variant="body2"
+              sx={{
+                cursor: "pointer",
+                "&:hover": { textDecoration: "underline" },
+                textOverflow: "ellipsis",
+                overflow: "hidden",
+                whiteSpace: "nowrap",
+              }}
+              onClick={() =>
+                navigate(scopeHref(library, `/datasets/${encodeURIComponent(row.name)}`))
+              }
+            >
+              {row.name}
+            </Typography>
+          </Tooltip>
+        ),
       },
       {
         accessorKey: "description",
@@ -129,7 +127,7 @@ const Datasets = () => {
       <MenuItem
         key="delete"
         onClick={() => {
-          handleRequestDelete([row.original.path.replace(/^datasets\//, "")]);
+          handleRequestDelete([row.original.name]);
           closeMenu();
         }}
       >
@@ -148,7 +146,7 @@ const Datasets = () => {
           color="negative"
           disabled={!hasSelection}
           onClick={() => {
-            const names = selectedRows.map((r) => r.original.path.replace(/^datasets\//, ""));
+            const names = selectedRows.map((r) => r.original.name);
             if (names.length > 0) handleRequestDelete(names);
           }}
         >
@@ -165,14 +163,14 @@ const Datasets = () => {
     muiTableBodyRowProps: () => ({
       sx: {
         cursor: "pointer",
-        backgroundColor: GLOBAL_BACKGROUND_COLOR,
+        backgroundColor: TABLE_BG,
         "& > td": {
-          backgroundColor: `${GLOBAL_BACKGROUND_COLOR} !important`,
+          backgroundColor: `${TABLE_BG} !important`,
         },
       },
     }),
     muiTablePaperProps: {
-      sx: { backgroundColor: GLOBAL_BACKGROUND_COLOR },
+      sx: { backgroundColor: TABLE_BG },
     },
     state: { sorting, rowSelection },
     onSortingChange: setSorting,
@@ -194,11 +192,7 @@ const Datasets = () => {
             >
               Datasets
             </Typography>
-            <Button
-              onClick={() => navigate(`/${library}/datasets/_create`)}
-            >
-              Add Dataset
-            </Button>
+            <Button onClick={() => setCreateOpen(true)}>Add Dataset</Button>
           </Stack>
         }
       >
@@ -231,6 +225,15 @@ const Datasets = () => {
           </Button>
         </DialogActions>
       </Dialog>
+      <CreateItemDialog
+        open={createOpen}
+        kind="dataset"
+        scopeId={library}
+        onClose={() => setCreateOpen(false)}
+        onCreated={(sid, id) =>
+          navigate(scopeHref(sid, `/datasets/${encodeURIComponent(id)}`))
+        }
+      />
     </Box>
   );
 };

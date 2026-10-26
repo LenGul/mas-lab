@@ -1,9 +1,9 @@
 #  Copyright (c) 2026 Cisco Systems, Inc. and its affiliates
 #  SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
-
 """Benchmark export/import commands."""
+
+from __future__ import annotations
 
 import hashlib
 import logging
@@ -518,7 +518,9 @@ def publish_hf_command(args) -> int:
         )
     else:
         print(
-            f"\n✓ Uploaded to https://huggingface.co/datasets/{repo_id}/tree/{revision}/{path_in_repo.rsplit('/', 1)[0]}"
+            "\n✓ Uploaded to "
+            f"https://huggingface.co/datasets/{repo_id}/tree/{revision}/"
+            f"{path_in_repo.rsplit('/', 1)[0]}"
         )
     return 0
 
@@ -553,7 +555,7 @@ def import_hf_command(args) -> int:
         return 1
 
     download_root = Path(tempfile.mkdtemp(prefix="mas-lab-hf-import-"))
-    print(f"\nDownloading benchmark archive")
+    print("\nDownloading benchmark archive")
     print(f"  Repo:   {repo_id}")
     print(f"  Path:   {path_in_repo}")
     if revision:
@@ -759,7 +761,7 @@ def export_command(args) -> int:
     print(
         f"\nTo restore to a temp directory:\n  mas-lab benchmark import {out_path} \\"
     )
-    print(f"      --output-dir /tmp/test-bench --trace-cache /tmp/test-trace-cache")
+    print("      --output-dir /tmp/test-bench --trace-cache /tmp/test-trace-cache")
     return 0
 
 
@@ -851,7 +853,7 @@ def import_command(args) -> int:
         f"  Before import — cache coverage: {cached_before}/{total_runs} runs available"
     )
     if cached_before == 0 and total_runs > 0:
-        print(f"  (to verify from a fresh environment, run first:)")
+        print("  (to verify from a fresh environment, run first:)")
         print(f"    export {_paths.MAS_DATA_ROOT_ENV}={data_root}")
         print(f"    mas-lab benchmark show {short_id}")
     print()
@@ -863,7 +865,7 @@ def import_command(args) -> int:
                 for m in tar.getmembers()
                 if not m.name.endswith(".json") or m.name == "MANIFEST.json"
             ]
-            print(f"  [dry-run — nothing written]")
+            print("  [dry-run — nothing written]")
             print(f"  Archive contains {len(members)} entries")
         return 0
 

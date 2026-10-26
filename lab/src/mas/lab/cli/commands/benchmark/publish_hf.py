@@ -37,7 +37,10 @@ import click
     "--revision",
     default="main",
     show_default=True,
-    help="Branch or commit SHA to target for the upload; when --create-pr is set it creates a reviewable revision from this base.",
+    help=(
+        "Branch or commit SHA to target for the upload; when --create-pr is set "
+        "it creates a reviewable revision from this base."
+    ),
 )
 @click.option(
     "--create-pr/--no-create-pr",

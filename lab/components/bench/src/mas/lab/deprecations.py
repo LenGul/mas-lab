@@ -14,7 +14,7 @@ from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
-DOCS_BASE = "https://outshift-open.github.io/mas-lab"
+DOCS_BASE = "https://ioc-project.github.io/mas-lab"
 
 # code -> (docs path under /docs, short replacement)
 NOTICES: Dict[str, Tuple[str, str]] = {
@@ -53,6 +53,11 @@ NOTICES: Dict[str, Tuple[str, str]] = {
     "dataset.legacy_expectations": (
         "manifests/dataset-migration.md",
         "put app- or tool-specific ground truth under expectations.details",
+    ),
+    "pipeline.output_dir_template": (
+        "manifests/pipeline.md#output-locations",
+        "drop the {output_dir}/ prefix: use a relative path (results/trace_stats.csv) "
+        "or omit the key to get the step's default artifact",
     ),
     "experiment.execution": (
         "manifests/experiment.md#design-vs-schedule",

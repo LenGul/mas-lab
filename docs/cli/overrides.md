@@ -2,73 +2,156 @@
   Copyright (c) 2026 Cisco Systems, Inc. and its affiliates
   SPDX-License-Identifier: Apache-2.0
 -->
-# CLI Override Reference
+# CLI overrides
 
-The general CLI override syntax lets a command patch a loaded manifest or
-in-memory configuration without creating a temporary overlay file:
+`--override` changes one field of a manifest from the command line, without writing an overlay file. Use it for a quick patch to a single run. Part of [References → CLI](../references/index.md#cli). Topic index: [command line](index.md).
 
-```text
---override ROOT:PATH=VALUE
-```
+Terms: a *manifest* is a YAML file that declares an agent, a MAS, or an experiment. An *overlay* is a small YAML file merged on top of a manifest. See the [glossary](../glossary.md).
 
-Every override is converted to a canonical `apiVersion: mas/v1`,
-`kind: Overlay` document and is processed by the same normalization, merge,
-operator, and validation code as a file overlay. Overrides are applied after
-all `--overlay` files and after legacy inline flags.
-
-## Quick examples
+## The three overrides most people run
 
 ```bash
-# Agent field
-mas-ctl chat agent.yaml \
-  --override 'agent:spec.context.role="security reviewer"'
-
-# Add a tool with the existing overlay operator
-mas-ctl chat agent.yaml \
-  --override 'agent:spec.tools={"$op":{"add":["web-search"]}}'
-
-# Select one agent inside a MAS
-mas-ctl run-mas mas.yaml \
-  --override 'mas:spec.agency.agents[id=reviewer].spec.memory=long'
-
-# Fan out to every MAS agent
-mas-ctl run-mas mas.yaml \
-  --override 'mas:spec.agency.agents[*].spec.context.environment=staging'
-
-# Compile an effective manifest
-mas-ctl compile mas.yaml \
-  --override 'mas:spec.models[id=main].model="gpt-test"'
-
-# Benchmark experiment configuration
-mas-lab benchmark run experiment.yaml \
-  --override 'experiment:experiment.run.n_runs=1' \
-  --override 'experiment:experiment.dataset.limit=2'
-
-# Workspace values are changed only in memory for this invocation
-mas-ctl chat agent.yaml \
-  --override 'workspace:defaults.model="gpt-test"'
-
-# Address a context key containing dots
-mas-ctl chat agent.yaml \
-  --override 'agent:spec.context["key.with.dots"]=value'
-
-# Flavour posture (observability / tool exposure). Does not switch internal
-# agents to A2A — that is an infra Application `usage: use` row (`--bind` is
-# a shortcut for the same fields).
-mas-ctl chat agent.yaml \
-  --override 'flavour:spec.observability=[native]'
+mas-ctl chat agent.yaml --override '.agent.spec.context.role="security reviewer"'   # standalone agent
+mas-ctl chat agent.yaml --override '.agent.spec.models[*].max_tokens=4096'           # every model row
+mas-ctl run-mas mas.yaml --override '.mas.spec.workflow.entry=moderator'             # the MAS, not an agent
 ```
+
+An override never edits a file on disk. It patches the in-memory manifest for one command.
+
+## Syntax
+
+```text
+--override PATH=VALUE
+```
+
+`PATH` starts at the current session, like jq:
+
+```text
+.mas.agent[planner].spec.context.role
+.infra.spec.interceptors[middleware=llm_cache].params.allow_write
+.config.defaults.model
+```
+
+- The leading `.` is the session. `.agent.spec…` and `agent.spec…` are the same path.
+- The first segment is a **type**: `mas`, `infra`, `flavour`, `config` (workspace `config.yaml`), `experiment`, or `agent`.
+- A name in brackets is an **id**, the same idea as Overlay `spec.target.name`: `agent[planner]` or `agent[id=planner]`.
+- The rest walks that document's YAML tree. A selector in square brackets picks list entries.
+- `VALUE` is a YAML value.
+
+`agent` is a session child only for a standalone Agent command (`chat`, `compile agent.yaml`). A MAS session has several agents, so the path goes through the MAS: `.mas.agent[planner].…`.
+
+`kind:path` (`agent:spec.context.role`) is still accepted as an alias of `kind.path`. Prefer the dotted session path.
+
+Quote the whole assignment in the shell. Quoting is required when it contains `$`, brackets, spaces, braces, or quotes.
+
+A CLI path is the same hierarchy as a file Overlay. The session node (type and optional id) is Overlay `spec.target`. Everything after it is Overlay `spec.patch` — `spec.models[id=main].max_tokens=4096` is `{models: [{id: main, max_tokens: 4096}]}`. File overlays and `--override` merge that dict through the same engine. Envelope fields (`metadata`) and kinds without `spec` (`library`, `experiment`, `config`) are assigned on the document, then schema-validated.
+
+### Overlay fields vs `--override`
+
+An Overlay is a named patch document. `--override` is one assignment, not a document, so it has no Overlay `kind` / `metadata.name`.
+
+| Overlay | `--override` |
+| --- | --- |
+| `kind: Overlay` | (none — CLI one-shot) |
+| `metadata.name` | (none — generated as `cli-override`) |
+| `spec.target.kind` | session type (`mas`, `agent`, `infra`, …) |
+| `spec.target.name` | `agent[planner]` / `mas[team]` |
+| `spec.patch` | field path `= VALUE` |
+
+## Selector examples
+
+A selector chooses which list entry the path continues into.
+
+| Goal | Override | Result |
+| --- | --- | --- |
+| Set a field | `.agent.spec.context.role="reviewer"` | The standalone agent role becomes `reviewer`. |
+| Add to a list | `.agent.spec.tools={"$op":{"add":["web-search"]}}` | `web-search` joins the tool list. |
+| Remove from a list | `.agent.spec.tools={"$op":{"remove":["calculator"]}}` | `calculator` leaves the tool list. |
+| Select by id | `.agent.spec.models[id=main].model="gpt-test"` | Only the model entry whose `id` is `main` changes. |
+| One MAS agent | `.mas.agent[planner].spec.design_pattern=cot` | Overlay `target.kind: Agent`, `target.name: planner`. |
+| Wildcard | `.agent.spec.models[*].max_tokens=4096` | Every model entry gets `max_tokens: 4096`. |
+
+A selector that matches nothing fails with an error that names the requested identity.
+
+## Task guide
+
+### Change a field on a standalone agent
+
+```bash
+mas-ctl chat agent.yaml --override '.agent.spec.context.role="security reviewer"'
+```
+
+### Change a field on a MAS
+
+```bash
+mas-ctl run-mas mas.yaml --override '.mas.spec.workflow.entry=moderator'
+```
+
+### Change one agent inside a MAS
+
+```bash
+mas-ctl run-mas mas.yaml \
+  --override '.mas.agent[reviewer].spec.design_pattern=cot'
+```
+
+That is Overlay `target.kind: Agent` plus `target.name: reviewer`. It applies to a referenced `{id, ref}` row and to an inline `spec`. See [Agents in a MAS](#agents-in-a-mas).
+
+### Change every agent in a MAS
+
+```bash
+mas-ctl run-mas mas.yaml \
+  --override '.mas.agent[*].spec.design_pattern=cot'
+```
+
+### Inspect the effect without running
+
+```bash
+mas-ctl compile agent.yaml --override '.agent.spec.models[*].max_tokens=4096'
+```
+
+`compile` prints the resolved Agent manifest. See [compile](compile.md).
+
+### Change an experiment setting
+
+```bash
+mas-lab benchmark run experiment.yaml \
+  --override '.experiment.experiment.run.n_runs=1' \
+  --override '.experiment.experiment.dataset.limit=2'
+```
+
+### Change a workspace value for one run
+
+```bash
+mas-ctl chat agent.yaml --override '.config.defaults.model="gpt-test"'
+```
+
+The workspace `config.yaml` stays unchanged. `.workspace` is the same node.
+
+### Address a key that contains dots
+
+```bash
+mas-ctl chat agent.yaml --override '.agent.spec.context["key.with.dots"]=value'
+```
+
+The quoted key keeps dots and brackets inside one map key.
+
+### Set observability on the flavour
+
+```bash
+mas-ctl chat agent.yaml --override '.flavour.spec.observability=[native]'
+```
+
+A *flavour* is a deployment preset. This override changes observability and tool exposure. It does not switch internal agents to A2A. That needs an infra Application row with `usage: use`, which `--bind` writes for you.
 
 ## Bind
 
-`--bind NAME=URI` is a **shortcut for infra YAML**, not a second wiring path.
-It expands into `--override infra:…` and is merged into the same in-memory
-Application / ToolServerRegistry document as `--infra-ref`. There is no
-separate bind resolver: `chat`, `tui`, `run-mas`, `serve`, and `compose` all
-consume the patched infra. `--bind` is applied first, so an explicit
-`--override` of the same path still wins.
+`--bind NAME=URI` is a shortcut for infra YAML. It expands into `--override infra:…`.
 
-Equivalent forms:
+An *infra bundle* is a YAML file that says where services live: agent endpoints and tool servers. The bind result merges into the same in-memory infra document as `--infra-ref`. No separate bind resolver exists. `chat`, `tui`, `run-mas`, `serve`, and `compose` all read the patched infra.
+
+`--bind` applies first. An explicit `--override` of the same path wins.
+
+These two forms are equivalent:
 
 ```yaml
 # infra/a2a-agents.yaml — kind: Application
@@ -86,6 +169,8 @@ mas-ctl run-mas mas.yaml \
   --bind banking_assistant=a2a://127.0.0.1:8080/agents/banking_assistant/
 ```
 
+Repeat `--bind` for several peers and tools:
+
 ```bash
 mas-ctl run-mas mas.yaml \
   --bind banking_assistant=a2a://127.0.0.1:8080/agents/banking_assistant/ \
@@ -99,164 +184,141 @@ mas-ctl run-mas mas.yaml \
 | `NAME=a2a://host:port/path/` | `infra:spec.endpoints['NAME']={protocol: a2a, usage: use, url: http://host:port/path/}` |
 | `NAME=mcp://host:port/mcp#tool` | `infra:spec.tool_servers[id=…]={protocol: mcp, usage: use, url: http://…, tools: [tool]}` |
 
-`a2a://` / `mcp://` are scheme tags; stored URLs are `http://` or `https://`
-(`a2as://` / `mcps://`). Two MCP tools on the same origin collapse to one
-server. The MAS still names the agency peer, and the agent still lists the
-tool; `--bind` only fills location on the infra document. Flavour stays
-`local` (`agent_comm.protocol: agent-local`) — Application `usage: use` is
-what routes that peer over A2A.
+- `a2a://` and `mcp://` are scheme tags. The stored URL is `http://` or `https://` (`a2as://` and `mcps://` give `https://`).
+- Two MCP tools on the same origin collapse to one server.
+- The MAS still names the agency peer, and the agent still lists the tool. `--bind` only fills in the location on the infra document.
+- The flavour stays `local` (`agent_comm.protocol: agent-local`). The Application `usage: use` row routes that peer over A2A.
 
-## Manifest tree
+## Session tree
 
-The path starts at a named root. The root identifies the document before the
-path walks through its YAML tree.
+Every loaded manifest hangs off the current session. Types are path segments; ids are jq-style brackets.
 
 ```text
-workspace/config.yaml
+.
+  +-- config / workspace ------------------- .config.*
   |
-  +-- experiment.yaml ---------------------- experiment:experiment.*
-  |                                            |
-  |                                            +-- application (MAS binding)
-  |                                            +-- scenarios
-  |                                            +-- dataset
-  |                                            +-- run / pipeline
+  +-- experiment --------------------------- .experiment.experiment.*
+  |                                            +-- application (the MAS under test)
+  |                                            +-- scenarios / dataset / run
   |
-  +-- mas.yaml ----------------------------- mas:spec.*
+  +-- mas ---------------------------------- .mas.spec.*
   |       |
-  |       +-- spec.agency.agents[id=planner]
-  |                    |
+  |       +-- agent[planner] --------------- .mas.agent[planner].spec.*
   |                    +-- ref: agents/planner.yaml
-  |                    +-- inline spec
+  |                    +-- or an inline spec
   |
-  +-- agent.yaml --------------------------- agent:spec.*
-  |       |
-  |       +-- tools, skills, models
-  |       +-- context, memory, governance
+  +-- agent -------------------------------- .agent.spec.*   (standalone session only)
   |
-  +-- infra refs --------------------------- infra:spec.*
-  +-- flavour ------------------------------ flavour:spec.*
+  +-- infra -------------------------------- .infra.spec.*
+  +-- flavour ------------------------------ .flavour.spec.*
 ```
 
-The path is explicit because `spec.tools` can belong to a standalone Agent,
-an entry Agent inside a MAS, or an infrastructure provider. The command decides
-which roots are loaded; an unavailable root is an error, not a silent no-op.
+There is no generic `manifest` node. `spec.tools` is not unique until the type is in the path. The command decides which children exist. Naming a missing node is an error, not a silent no-op.
 
-## Supported roots
-
-| Root | Typical commands | Meaning |
+| Path | Typical commands | Meaning |
 | --- | --- | --- |
-| `agent` | `chat`, `compile` | Standalone Agent manifest |
-| `mas` | `run-mas`, `compose`, `compile` | MAS or Workflow manifest |
-| `infra` | `chat`, `run-mas`, `compose` | Effective merged infrastructure |
-| `flavour` | runtime composition | Effective deployment flavour |
-| `experiment` | `mas-lab benchmark run` | Experiment before validation and expansion |
-| `workspace` | `chat`, `run-mas` | In-memory effective workspace/config values |
+| `.agent` | `chat`, `compile` of an Agent | Standalone Agent document |
+| `.mas` | `run-mas`, `compose`, `compile` of a MAS | MAS or Workflow document |
+| `.mas.agent[id]` | those MAS commands | One agency agent (Overlay `target.name`) |
+| `.infra` | `chat`, `run-mas`, `compose`, `compile` | Infra, or the merged infra document |
+| `.flavour` | runtime composition, `compile` | Flavour manifest |
+| `.library`, `.tool`, `.pipeline`, `.dataset` | `compile` | Other registered schema kinds |
+| `.experiment` | `mas-lab benchmark run`, `compile` | Experiment before validation and expansion |
+| `.config` / `.workspace` | `chat`, `run-mas`, `compile` | In-memory effective workspace / `config.yaml` |
 
-An entry Agent inside a MAS is addressed through the MAS root:
+A MAS agent is not `.agent`:
 
 ```text
-mas:spec.agency.agents[id=planner].spec.tools
+.mas.agent[planner].spec.tools
+.agent.spec.tools          # standalone Agent session only
 ```
 
-It is deliberately different from:
+### Agents in a MAS
 
-```text
-agent:spec.tools
+`.mas.agent[planner]` is the typed path. It becomes an Overlay with `target.kind: Agent` and `target.name: planner`, so it works for `{id, ref}` rows and for inline `spec` rows.
+
+Walking the MAS YAML (`.mas.spec.agency.agents[id=planner].spec.tools`) still works when that row already has an inline `spec`. The usual tutorial row is `{id: planner, ref: agents/planner.yaml}` and has no `spec`, so that YAML walk fails with `path segment 'spec' does not exist`. Use `.mas.agent[planner].…` instead.
+
+You cannot select a model through `.mas.spec`. Use `--model`, or the experiment's `models:` slots.
+
+Resolved infra exposes its ordered middleware chain as `spec.interceptors`, including each entry's `middleware`, `applies_to`, and typed `params`:
+
+```bash
+mas-ctl chat agent.yaml --infra-ref infra/llm-cache.yaml \
+  --override '.infra.spec.interceptors[middleware=llm_cache].params.allow_write=true' \
+  --override '.infra.spec.interceptors[middleware=llm_cache].params.raise_on_miss=false'
 ```
 
-The latter addresses a standalone Agent document.
+Infra overrides apply after merging infra refs, interceptors, and runtime profiles, and they keep the other resolved resources. Provider settings live under `spec.proxy`, MCP servers under `spec.tool_servers[id=...]`, A2A peers under `spec.endpoints["name"]`, and engine policy under `spec.runtime_engine`. See [override-stack.yaml](../schemas/examples/infra/override-stack.yaml) for a complete example.
 
-## Path syntax
-
-The path grammar is:
+## Path grammar
 
 ```text
-assignment := ROOT ":" path "=" yaml-value
-path       := segment ("." segment)*
+assignment := path "=" yaml-value
+path       := ["."] node ("." node)* ("." segment)+
+node       := type | type "[" id "]" | type "[*]"
 segment    := identifier | identifier "[" selector "]"
-selector   := integer | identity | "*"
+selector   := integer | identity | id | "*" | quoted-key
 identity   := key "=" yaml-scalar
 ```
 
-Examples:
+`type:path` is an alias of `type.path`. More paths:
 
 ```text
-agent:spec.context.role
-agent:spec.models[id=main].model
-mas:spec.agency.agents[id=planner].spec.context.role
-mas:spec.agency.agents[0].spec.memory
-mas:spec.agency.agents[*].spec.context.environment
-infra:spec.tool_servers[id=mcp].port
-experiment:experiment.run.n_runs
-workspace:defaults.model
+.agent.spec.models[id=main].model
+.mas.agent[planner].spec.context.role
+.mas.spec.workflow.entry
+.infra.spec.tool_servers[id=mcp].port
+.experiment.experiment.run.n_runs
+.config.defaults.model
 ```
 
-Identity selectors are preferred over numeric indexes because indexes can move
-when an overlay adds or removes list entries. A selector that matches no entry
-fails with an error listing the requested identity. Wildcards expand in
-manifest order and apply the same operation to every match.
+Prefer identity selectors to numeric indexes. An index moves when an overlay adds or removes list entries. A wildcard expands in manifest order and applies the same operation to every match.
 
-Intermediate path segments must already exist. The final key may be absent
-only when the target schema declares it, so
-`agent:spec.models[*].max_tokens=4096` adds `max_tokens` to every model row
-while a typo such as `max_tokenz` is rejected.
-
-Quoted mapping-key selectors keep dots and brackets inside a map key instead of
-treating them as path separators:
-
-```text
-agent:spec.context["key.with.dots"]
-```
+A path may create missing **keys** when the target schema documents them: declared properties, `patternProperties`, `additionalProperties` maps, and matching `if`/`then` plugin fields. Unknown names fail. Updating a field through an identity selector (`models[id=ghost].max_tokens`) requires that row to exist and to be a list; assigning the whole row (`tool_servers[id=mcp]={…}`) may add it. `$op add` appends to a list and is rejected on a scalar. So `.agent.spec.models[*].max_tokens=4096` adds `max_tokens` to every model row, `.agent.metadata.version=1.0.0` fills an omitted envelope field, and a typo such as `max_tokenz` is rejected.
 
 ## Values
 
-Values are parsed as YAML values after shell parsing:
+The value is parsed as YAML after shell parsing:
 
 ```bash
---override 'agent:spec.enabled=true'       # boolean
---override 'agent:spec.max_steps=10'        # integer
---override 'agent:spec.temperature=0.2'     # number
---override 'agent:spec.name="qa agent"'     # string
---override 'agent:spec.tags=[qa,fast]'       # list
---override 'agent:spec.params={mode: safe}'  # map
+--override '.agent.spec.models[*].max_tokens=4096'       # integer
+--override '.agent.spec.models[*].temperature=0.2'       # number
+--override '.agent.spec.description="qa agent"'          # string
+--override '.agent.spec.context.tags=[qa,fast]'          # list
+--override '.agent.spec.design_pattern={type: cot}'      # map
 ```
 
-Quote the entire assignment in the shell when it contains `$`, brackets,
-spaces, braces, or quotes. The value is validated again against the target
-schema after merge.
+Booleans (`true` and `false`) parse the same way for boolean fields. The merged result is validated again against the target schema.
 
 ## Operators
 
-The same `$op` forms accepted by file overlays are accepted by CLI overrides
-where the target field's `x-merge` strategy supports them:
+CLI overrides accept the same `$op` forms as file overlays. Each form works where the target field's `x-merge` strategy supports it.
 
 ```bash
 # Replace a collection
---override 'agent:spec.tools={"$op":{"replace":["calculator"]}}'
+--override '.agent.spec.tools={"$op":{"replace":["calculator"]}}'
 
 # Append to a list
---override 'agent:spec.tools={"$op":{"add":["web-search"]}}'
+--override '.agent.spec.tools={"$op":{"add":["web-search"]}}'
 
 # Remove from a list
---override 'agent:spec.tools={"$op":{"remove":["calculator"]}}'
+--override '.agent.spec.tools={"$op":{"remove":["calculator"]}}'
 
 # Clear a collection
---override 'agent:spec.skills={"$op":{"clear":true}}'
+--override '.agent.spec.skills={"$op":{"clear":true}}'
 
 # Merge a mapping
---override 'agent:spec.context={"$op":{"merge":{"role":"reviewer"}}}'
+--override '.agent.spec.context={"$op":{"merge":{"role":"reviewer"}}}'
 ```
 
-Raw values use the field's normal overlay behavior. For example, a raw list
-means replacement for a `list_ops` field, while a named list uses its schema
-declared identity strategy.
+A raw value follows the field's normal overlay behaviour. A raw list replaces a `list_ops` field. A named list uses the identity strategy its schema declares.
 
-## Grouping overrides in an overlay manifest
+## Group overrides in an overlay file
 
-An `Overlay` manifest can carry an ordered `spec.overrides` list when the same
-selector-based changes should be reused by scenarios or several commands. Each
-item uses the same `ROOT:PATH=VALUE` syntax as the CLI, and is applied after the
-manifest's regular `spec.patch`:
+Put several overrides in an `Overlay` manifest when scenarios or commands should reuse them. The ordered list `spec.overrides` takes the same session-tree syntax as the CLI. Items apply after the manifest's regular `spec.patch`.
+
+To patch one MAS agent, set Overlay `target.kind: Agent` and `target.name` — that is `.mas.agent[reviewer]`:
 
 ```yaml
 apiVersion: mas/v1
@@ -264,21 +326,19 @@ kind: Overlay
 metadata:
   name: review-policy
 spec:
-  target: {kind: MAS}
+  target: {kind: Agent, name: reviewer}
   patch: {}
   overrides:
-    - 'mas:spec.agency.agents[id=reviewer].spec.memory=long'
-    - 'mas:spec.agency.agents[*].spec.context.environment=staging'
+    - '.mas.agent[reviewer].spec.design_pattern=cot'
 ```
 
-The root must match the overlay target kind. Identity selectors and wildcards
-operate on entries already present in the effective document; an unmatched
-selector is an error. The overlay is still validated as a normal `mas/v1`
-Overlay, and source manifests remain unchanged.
+Omit `target.name` and write `.mas.agent[*].spec…` to patch every nested agent.
+
+`target.kind` must match the session type of every `spec.overrides` expression. Selectors act on entries already in the effective document. An unmatched selector is an error. The overlay is validated as a normal `mas/v1` Overlay, and source manifests stay unchanged.
 
 ## Priority
 
-The effective order is:
+Later layers win:
 
 ```text
 workspace/config defaults
@@ -289,52 +349,44 @@ workspace/config defaults
   < runtime defaults for fields still absent
 ```
 
-The later CLI override wins when the field strategy allows multiple writes.
-Conflicting wildcard operations or unsupported operations fail rather than
-using accidental dictionary ordering.
+The later CLI override wins when the field strategy allows several writes. Conflicting wildcard operations and unsupported operations fail. They never fall back to dictionary order.
 
 ## Legacy shortcuts
 
-Existing flags remain supported:
+These flags still work:
 
-| Existing flag | Equivalent intent |
+| Flag | Equivalent |
 | --- | --- |
-| `--tool NAME` | Add `NAME` to `agent:spec.tools` |
-| `--skill NAME` | Add `NAME` to `agent:spec.skills` |
-| `--memory ID` | Replace `agent:spec.memory` |
-| `--set KEY=VALUE` | Set an Agent context value |
-| `--bind NAME=URI` | Shortcut for Application / ToolServerRegistry `usage: use` on the merged infra document |
-| `--max-tokens N` | Alias of `--override 'agent:spec.models[*].max_tokens=N'`, placed before explicit `--override` values (`chat`, `tui`) |
-| `--overlay PATH` | Load a file Overlay before CLI values |
-| `--scenario-id ID` | Benchmark selection shortcut |
-| `--dataset-item ID` | Benchmark dataset selection shortcut |
+| `--tool NAME` | Add `NAME` to `.agent.spec.tools`. |
+| `--skill NAME` | Add `NAME` to `.agent.spec.skills`. |
+| `--memory ID` | Replace `.agent.spec.memory`. |
+| `--set KEY=VALUE` | Set an agent context value. |
+| `--bind NAME=URI` | Shortcut for Application and ToolServerRegistry `usage: use` rows on the merged infra document. |
+| `--max-tokens N` | Alias of `--override '.agent.spec.models[*].max_tokens=N'`. Placed before explicit `--override` values (`chat`, `tui`). |
+| `--overlay PATH` | Load a file overlay before CLI values. |
+| `--scenario-id ID` | Select a benchmark scenario. |
+| `--dataset-item ID` | Select a benchmark dataset item. |
 
-These flags remain the compatibility interface for common operations. General
-`--override` is the explicit interface when the path, root, selector, or merge
-operation matters.
+Use `--override` when the path, root, selector, or merge operation matters.
 
-## References and safety
+## Safety
 
-Overrides never rewrite source YAML files or `config.yaml`. They operate on the
-effective in-memory document for one command invocation.
+Overrides never rewrite source YAML files or `config.yaml`. They patch the effective in-memory document for one command.
 
-For ref-based MAS agents, address the entry through the MAS path. The document
-must be materialized by the command before a nested field can be selected. Use
-an explicit identity selector rather than relying on list position:
+For a MAS agent, use the typed id, not a list position:
 
 ```bash
 mas-ctl run-mas mas.yaml \
-  --override 'mas:spec.agency.agents[id=planner].spec.context.role=planner'
+  --override '.mas.agent[planner].spec.context.role=planner'
 ```
 
-Invalid roots, paths, selectors, operations, or final schema values fail before
-runtime execution. Diagnostics include the original override expression and the
-failing root/path.
+That includes agents referenced by `ref:`. See [Agents in a MAS](#agents-in-a-mas).
 
-Schemas may mark a field with `x-cli: {allowed: false}` to protect generated or
-runtime-owned values. Such a path is rejected before merge.
+Invalid paths, selectors, operations, or final schema values fail before the runtime starts. The error shows the override expression and the failing path.
 
-Related references:
+A schema can mark a field `x-cli: {allowed: false}` to protect generated or runtime-owned values. Such a path is rejected before the merge.
+
+## Related
 
 - [mas-ctl command reference](mas-ctl.md)
 - [Overlay manifest](../manifests/overlay.md)

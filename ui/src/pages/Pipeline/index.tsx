@@ -12,14 +12,6 @@ import {
   Stack,
   Typography,
   useTheme,
-  Tabs,
-  Tab,
-  Button,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  TextField,
   Alert,
 } from "@mui/material";
 import { useLocation, useNavigate, useParams } from "react-router";
@@ -34,13 +26,25 @@ import {
   pollJob,
 } from "@/api/apiCalls";
 import { useQueryClient } from "@tanstack/react-query";
+import { scopeHref, useScopeId } from "@/api/scope";
+import {
+  Button,
+  InputField,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Tab,
+  Tabs,
+} from "@open-ui-kit/core";
 
 const TAB_KEYS = ["graph", "yaml"] as const;
 type PipelineTab = (typeof TAB_KEYS)[number];
 
 const Pipeline = () => {
   const theme = useTheme();
-  const { id, pipelineTab, library } = useParams();
+  const library = useScopeId();
+  const { id, pipelineTab } = useParams();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
@@ -135,10 +139,7 @@ const Pipeline = () => {
         setIsRunning(false);
         return;
       }
-      const { job_id } = await runPipeline(library, {
-        pipeline_yaml: yamlToRun,
-        timeout: 1200,
-      });
+      const { job_id } = await runPipeline(library, id);
 
       const POLL_INTERVAL = 1500;
       let result = await pollJob(job_id);
@@ -232,7 +233,7 @@ const Pipeline = () => {
       handleCloseSaveDialog();
 
       if (trimmedName !== id) {
-        navigate(`/${library}/pipelines/${encodeURIComponent(trimmedName)}`, {
+        navigate(scopeHref(library, `/pipelines/${encodeURIComponent(trimmedName)}`), {
           replace: true,
         });
       }
@@ -296,7 +297,7 @@ const Pipeline = () => {
         </Typography>
         <Button
           variant="primary"
-          onClick={() => navigate(`/${library}/pipelines`)}
+          onClick={() => navigate(scopeHref(library, "/pipelines"))}
         >
           Back to Pipelines
         </Button>
@@ -448,7 +449,7 @@ const Pipeline = () => {
                     color: theme.palette.warning.main,
                   }}
                 >
-                  pipeline.yaml
+                  pipeline
                 </Typography>
                 <CodeBlock code={pipelineYaml || initialYaml} language="yaml" />
               </Box>
@@ -470,37 +471,35 @@ const Pipeline = () => {
               {saveError}
             </Alert>
           )}
-          <TextField
-            autoFocus
-            margin="dense"
-            label="Pipeline Name"
-            placeholder="Enter a name for the pipeline"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            value={pipelineName}
-            onChange={(e) => {
-              setPipelineName(e.target.value);
-              setSaveError("");
-            }}
-          />
-          <TextField
-            margin="dense"
-            label="Description"
-            placeholder="Optional description for the pipeline"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            multiline
-            minRows={2}
-            maxRows={4}
-            value={pipelineDescription}
-            onChange={(e) => setPipelineDescription(e.target.value)}
-          />
+          <Stack direction="column" sx={{ gap: "16px" }}>
+            <InputField
+              autoFocus
+              label="Pipeline Name"
+              placeholder="Enter a name for the pipeline"
+              autoComplete="off"
+              fullWidth
+              value={pipelineName}
+              onChange={(e) => {
+                setPipelineName(e.target.value);
+                setSaveError("");
+              }}
+            />
+            <InputField
+              label="Description"
+              placeholder="Optional description for the pipeline"
+              autoComplete="off"
+              fullWidth
+              multiline
+              minRows={2}
+              maxRows={4}
+              value={pipelineDescription}
+              onChange={(e) => setPipelineDescription(e.target.value)}
+            />
+          </Stack>
         </DialogContent>
         <DialogActions>
           <Button onClick={handleCloseSaveDialog}>Cancel</Button>
-          <Button variant="primary" onClick={handleSave} disabled={isSaving}>
+          <Button variant="gradient" onClick={handleSave} disabled={isSaving}>
             {isSaving ? "Saving..." : "Save"}
           </Button>
         </DialogActions>

@@ -1,7 +1,6 @@
 //  Copyright (c) 2026 Cisco Systems, Inc. and its affiliates
 //  SPDX-License-Identifier: Apache-2.0
 import { useCallback, useRef, useMemo, useEffect, useState } from "react";
-import { useParams } from "react-router";
 import { stringify, parse } from "yaml";
 import { AgentChatDrawer } from "./AgentChatDrawer";
 import {
@@ -40,52 +39,28 @@ import {
   type YamlOutputMap,
   type ChatMessage,
 } from "./types";
+import { autoLayoutYamlMap } from "./autoLayout";
 import "./canvasBuilder.css";
+import { useScopeId } from "@/api/scope";
 
 function generateNodeId(): string {
   return `node_${crypto.randomUUID().slice(0, 8)}`;
 }
 
-/**
- * Convert manifest ``{ ref: path }`` tool entries to display names for the canvas.
- *
- * Refs pointing to ``../../../tools/<name>.tool.yaml`` (global tools) are
- * returned as ``global/<name>``.  Refs pointing to ``../tools/<name>.tool.yaml``
- * (app-local tools) are returned as ``<name>``.
- */
+/** Keep backend refs as-is (the UI never composes folder conventions). */
 function normalizeToolRefs(tools: unknown): string[] {
   if (!Array.isArray(tools)) return [];
   return tools.map((entry) => {
     if (entry && typeof entry === "object") {
       const obj = entry as Record<string, unknown>;
-      if (typeof obj.ref === "string") {
-        const ref = obj.ref;
-        const stem = ref.split("/").pop()?.replace(".tool.yaml", "") ?? ref;
-        if (ref.startsWith("../../../tools/")) {
-          return `global/${stem}`;
-        }
-        return stem;
-      }
+      if (typeof obj.ref === "string") return obj.ref;
     }
     return String(entry);
   });
 }
 
-/**
- * Convert canvas display tool names back to ``{ ref: path }`` entries for
- * agent YAML serialization.
- *
- * ``global/<name>`` -> ``{ ref: ../../../tools/<name>.tool.yaml }``
- * ``<name>``        -> ``{ ref: ../tools/<name>.tool.yaml }``
- */
 function toolDisplayNamesToRefs(tools: string[]): Array<{ ref: string }> {
-  return tools.map((name) => {
-    if (name.startsWith("global/")) {
-      const bare = name.slice("global/".length);
-      return { ref: `../../../tools/${bare}.tool.yaml` };
-    }
-    return { ref: `../tools/${name}.tool.yaml` };
-  });
+  return tools.map((ref) => ({ ref }));
 }
 
 function normalizeIntent(intent: unknown): string {
@@ -114,7 +89,7 @@ function getDefaultDataForType(type: string): Record<string, unknown> {
         connectedMemory: "",
       };
     case "model":
-      return { model: "gpt-4o-mini", temperature: 0.7, max_tokens: 4096 };
+      return { model: "", temperature: 0.7, max_tokens: 4096 };
     case "designPattern":
       return { type: "react", max_steps: 10 };
     case "tool":
@@ -448,32 +423,6 @@ function buildDegrees(
   return { outDegree, inDegree };
 }
 
-/** DFS-based cycle detection on the directed agent-to-agent graph. */
-function hasCycle(agentNodes: Node[], agentEdges: Edge[]): boolean {
-  const visited = new Set<string>();
-  const stack = new Set<string>();
-  const adj = new Map<string, string[]>();
-  for (const node of agentNodes) adj.set(node.id, []);
-  for (const edge of agentEdges) adj.get(edge.source)?.push(edge.target);
-
-  function dfs(id: string): boolean {
-    if (stack.has(id)) return true;
-    if (visited.has(id)) return false;
-    visited.add(id);
-    stack.add(id);
-    for (const neighbor of adj.get(id) ?? []) {
-      if (dfs(neighbor)) return true;
-    }
-    stack.delete(id);
-    return false;
-  }
-
-  for (const node of agentNodes) {
-    if (dfs(node.id)) return true;
-  }
-  return false;
-}
-
 /**
  * BFS over the undirected agent graph to find connected components
  * (groups of agents linked by edges but disconnected from other groups).
@@ -551,27 +500,6 @@ function findEntryAgent(agentNodes: Node[], agentEdges: Edge[]): Node {
   return scored[0].node;
 }
 
-/**
- * Classify the MAS workflow topology from the agent-to-agent edge graph:
- *   - "sequential": linear chain (no branching/merging, no cycles)
- *   - "dynamic":    everything else (single agent, branching, merging, cycles)
- */
-function detectWorkflowType(
-  agentNodes: Node[],
-  agentEdges: Edge[],
-): "sequential" | "dynamic" {
-  if (agentNodes.length <= 1 || agentEdges.length === 0) return "dynamic";
-
-  if (hasCycle(agentNodes, agentEdges)) return "dynamic";
-
-  const { outDegree, inDegree } = buildDegrees(agentNodes, agentEdges);
-  const hasBranching = [...outDegree.values()].some((d) => d > 1);
-  const hasMerging = [...inDegree.values()].some((d) => d > 1);
-
-  if (hasBranching || hasMerging) return "dynamic";
-  return "sequential";
-}
-
 function serializeGraphToYamls(
   nodes: Node[],
   edges: Edge[],
@@ -600,7 +528,6 @@ function serializeGraphToYamls(
 
   // Build MAS manifest whenever at least one agent exists
   if (agentNodes.length >= 1) {
-    const workflowType = detectWorkflowType(agentNodes, agentEdges);
     const entryNode = findEntryAgent(agentNodes, agentEdges);
     const entryAgentId = getAgentId(entryNode);
 
@@ -612,7 +539,7 @@ function serializeGraphToYamls(
       const agentId = getAgentId(agentNode);
       return {
         id: agentId,
-        ref: `agents/${agentId}.yaml`,
+        ref: `${agentId}.agent`,
       };
     });
 
@@ -656,7 +583,6 @@ function serializeGraphToYamls(
     }
 
     const workflow: Record<string, unknown> = {
-      type: workflowType,
       entry: entryAgentId,
       nodes: workflowNodes,
     };
@@ -680,6 +606,24 @@ function serializeGraphToYamls(
   return result;
 }
 
+function overlayNodeIdsToCanvas(
+  raw: Record<string, string> | undefined,
+): Record<string, string> {
+  if (!raw) return {};
+  const aliases: Record<string, string> = {
+    designPattern: "design_pattern",
+    tool: "tools",
+    prompt_skills: "promptSkills",
+    context_skills: "contextSkills",
+    inputPrompt: "role",
+  };
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    out[aliases[key] ?? key] = value;
+  }
+  return out;
+}
+
 function deserializeYamlsToGraph(yamlMap: YamlOutputMap): {
   nodes: Node[];
   edges: Edge[];
@@ -691,6 +635,9 @@ function deserializeYamlsToGraph(yamlMap: YamlOutputMap): {
   const masDoc = masYaml ? parse(masYaml) : null;
   const canvasPositions: Record<string, { x: number; y: number }> =
     masDoc?.["x-canvas-positions"] ?? {};
+  const masCanvasNodeIds: Record<string, Record<string, string>> =
+    masDoc?.["x-canvas-node-ids"] ?? {};
+  const masTextInput: Record<string, string> = masDoc?.["x-text-input"] ?? {};
 
   const workflowNodes: {
     id: string;
@@ -709,10 +656,13 @@ function deserializeYamlsToGraph(yamlMap: YamlOutputMap): {
     const doc = parse(yamlMap[key]);
     const spec = doc?.spec ?? {};
     const metadata = doc?.metadata ?? {};
-    const canvasNodeIds: Record<string, string> =
-      doc?.["x-canvas-node-ids"] ?? {};
+    const canvasNodeIds: Record<string, string> = {
+      ...overlayNodeIdsToCanvas(masCanvasNodeIds[agentId]),
+      ...(doc?.["x-canvas-node-ids"] ?? {}),
+    };
 
-    const agentNodeId = metadata["x-node-id"] ?? agentId;
+    const agentNodeId =
+      metadata["x-node-id"] ?? canvasNodeIds.agent ?? agentId;
     const position = canvasPositions[agentNodeId] ??
       canvasPositions[agentId] ?? { x: 0, y: 0 };
     agentIdToNodeId.set(agentId, agentNodeId);
@@ -942,6 +892,7 @@ function deserializeYamlsToGraph(yamlMap: YamlOutputMap): {
 
     const textInputValue =
       spec["x-text-input"] ??
+      masTextInput[agentId] ??
       (spec["x-role-enabled"] === false ? spec["x-disabled-role"]?.text : null);
     const roleDisabled = spec["x-role-enabled"] === false;
     if (textInputValue) {
@@ -997,10 +948,13 @@ function CanvasFlow({
   initialYamlMap?: YamlOutputMap;
   masName?: string;
 }) {
-  const { library = "" } = useParams();
+  const library = useScopeId();
   const reactFlowWrapper = useRef<HTMLDivElement>(null);
   const initialGraph = useMemo(
-    () => (initialYamlMap ? deserializeYamlsToGraph(initialYamlMap) : null),
+    () =>
+      initialYamlMap
+        ? deserializeYamlsToGraph(autoLayoutYamlMap(initialYamlMap))
+        : null,
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
@@ -1017,7 +971,7 @@ function CanvasFlow({
   useEffect(() => {
     if (hasInitialized.current) return;
     if (!initialYamlMap || Object.keys(initialYamlMap).length === 0) return;
-    const graph = deserializeYamlsToGraph(initialYamlMap);
+    const graph = deserializeYamlsToGraph(autoLayoutYamlMap(initialYamlMap));
     if (graph.nodes.length === 0) return;
     setNodes(graph.nodes);
     setEdges(graph.edges);

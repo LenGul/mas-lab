@@ -13,14 +13,8 @@ import {
   Stack,
   Typography,
   useTheme,
-  Tabs,
-  Tab,
-  Button,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  TextField,
+  MenuItem,
+  Select,
   Alert,
 } from "@mui/material";
 import { useLocation, useNavigate, useParams } from "react-router";
@@ -37,13 +31,27 @@ import {
   pollJob,
 } from "@/api/apiCalls";
 import { useQueryClient } from "@tanstack/react-query";
+import { scopeHref, useScopeId } from "@/api/scope";
+import { forkItem, useItem } from "@/api/items";
+import { CreateItemDialog } from "@/components/CreateItemDialog";
+import {
+  Button,
+  Dialog,
+  InputField,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Tab,
+  Tabs,
+} from "@open-ui-kit/core";
 
 const APPLICATION_TAB_KEYS = ["graph", "yaml"] as const;
 type ApplicationTab = (typeof APPLICATION_TAB_KEYS)[number];
 
 const Application = () => {
   const theme = useTheme();
-  const { id, applicationTab, library } = useParams();
+  const library = useScopeId();
+  const { id, applicationTab } = useParams();
   const queryClient = useQueryClient();
 
   const [yamlOutputMap, setYamlOutputMap] = useState<YamlOutputMap>({});
@@ -62,6 +70,7 @@ const Application = () => {
     severity: "success" | "error";
   } | null>(null);
   const [isRunningMas, setIsRunningMas] = useState(false);
+  const [copyOpen, setCopyOpen] = useState(false);
 
   const validateMutation = useValidateAgent();
   const validateMasMutation = useValidateMas();
@@ -89,6 +98,16 @@ const Application = () => {
     isLoading: isMasLoading,
     isError: isMasError,
   } = useMasResourceDetail(library ?? "", id ?? "");
+  const { data: itemMeta } = useItem(library ?? "", "application", id ?? "");
+
+  useEffect(() => {
+    if (itemMeta?.resolved_id && id && itemMeta.resolved_id !== id) {
+      navigate(
+        scopeHref(library ?? "", `/applications/${encodeURIComponent(itemMeta.resolved_id)}`),
+        { replace: true },
+      );
+    }
+  }, [itemMeta?.resolved_id, id, library, navigate]);
 
   const initialYamlMap = useMemo<YamlOutputMap>(() => {
     if (!masResource) return {};
@@ -96,7 +115,7 @@ const Application = () => {
     const map: YamlOutputMap = {};
     if (!masResource.mas_yaml) return map;
 
-    let masDoc: Record<string, unknown> | null = null;
+    let masDoc: Record<string, unknown> | null;
     try {
       masDoc = parse(masResource.mas_yaml) as Record<string, unknown>;
     } catch {
@@ -185,7 +204,7 @@ const Application = () => {
     try {
       const { job_id } = await runMas({
         library,
-        manifest_yaml: masYaml,
+        item: id,
         query: textInput.trim(),
       });
 
@@ -232,7 +251,7 @@ const Application = () => {
     } finally {
       setIsRunningMas(false);
     }
-  }, [library, yamlOutputMap]);
+  }, [library, yamlOutputMap, id]);
 
   const handleValidateMas = useCallback(() => {
     if (!library) return;
@@ -295,15 +314,6 @@ const Application = () => {
         } else {
           delete masDoc.intent;
         }
-        const agentsList = masDoc.spec?.agency?.agents ?? masDoc.spec?.agents;
-        if (agentsList) {
-          for (const agent of agentsList) {
-            if (agent.ref) {
-              const filename = agent.ref.split("/").pop() ?? agent.ref;
-              agent.ref = `agents/${filename}`;
-            }
-          }
-        }
         finalYamlMap[key] = stringify(masDoc);
       } else {
         finalYamlMap[key] = yamlOutputMap[key];
@@ -345,7 +355,7 @@ const Application = () => {
       handleCloseSaveDialog();
 
       if (trimmedName !== id) {
-        navigate(`/${library}/applications/${trimmedName}`, { replace: true });
+        navigate(scopeHref(library, `/applications/${trimmedName}`), { replace: true });
       }
     } catch (err) {
       setSaveError(
@@ -400,7 +410,7 @@ const Application = () => {
         </Typography>
         <Button
           variant="primary"
-          onClick={() => navigate(`/${library}/applications`)}
+          onClick={() => navigate(scopeHref(library, "/applications"))}
         >
           Back to Applications
         </Button>
@@ -419,13 +429,57 @@ const Application = () => {
             width: "100%",
           }}
         >
-          <Typography
-            variant={"h5"}
-            sx={{ color: theme.palette.vars.interactivePrimaryDefaultDefault }}
-          >
-            {toTitleCase(id ?? "")}
-          </Typography>
+          <Stack direction="row" sx={{ alignItems: "center", gap: 2 }}>
+            <Typography
+              variant={"h5"}
+              sx={{ color: theme.palette.vars.interactivePrimaryDefaultDefault }}
+            >
+              {toTitleCase(itemMeta?.name ?? id ?? "")}
+            </Typography>
+            {(itemMeta?.versions?.length ?? 0) > 0 && (
+              <Select
+                size="small"
+                value={itemMeta?.version || itemMeta?.latest || ""}
+                onChange={(e) =>
+                  navigate(
+                    scopeHref(
+                      library ?? "",
+                      `/applications/${encodeURIComponent(`${itemMeta?.name}@${e.target.value}`)}`,
+                    ),
+                  )
+                }
+              >
+                {itemMeta?.versions.map((v) => (
+                  <MenuItem key={v} value={v}>
+                    {v}
+                  </MenuItem>
+                ))}
+              </Select>
+            )}
+            {itemMeta?.ref && (
+              <Typography variant="caption" sx={{ fontFamily: "monospace" }}>
+                {itemMeta.ref}
+              </Typography>
+            )}
+          </Stack>
           <Stack direction="row" sx={{ gap: "8px" }}>
+            {itemMeta && !itemMeta.writable && (
+              <>
+                <Alert severity="info">Read-only — copy into a writable scope.</Alert>
+                <Button onClick={() => setCopyOpen(true)}>Copy into…</Button>
+              </>
+            )}
+            {itemMeta && (
+              <Button
+                onClick={() => {
+                  void forkItem(library ?? "", "application", id ?? "", {}).then((created) =>
+                    navigate(scopeHref(library ?? "", `/applications/${encodeURIComponent(created.id)}`)),
+                  );
+                }}
+              >
+                New version
+              </Button>
+            )}
             <Button
               variant="primary"
               onClick={handleOpenSaveDialog}
@@ -601,9 +655,7 @@ const Application = () => {
                         : theme.palette.info.main,
                   }}
                 >
-                  {key === "mas"
-                    ? "mas.yaml"
-                    : `${key.replace("agent:", "")}.agent.yaml`}
+                  {key === "mas" ? "application" : key}
                 </Typography>
                 <CodeBlock code={yamlOutputMap[key]} language="yaml" />
               </Box>
@@ -625,52 +677,58 @@ const Application = () => {
               {saveError}
             </Alert>
           )}
-          <TextField
-            autoFocus
-            margin="dense"
-            label="MAS Name"
-            placeholder="Enter a name for the MAS"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            value={masName}
-            onChange={(e) => {
-              setMasName(e.target.value);
-              setSaveError("");
-            }}
-          />
-          <TextField
-            margin="dense"
-            label="Description"
-            placeholder="Enter a description"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            multiline
-            minRows={2}
-            value={masDescription}
-            onChange={(e) => setMasDescription(e.target.value)}
-          />
-          <TextField
-            margin="dense"
-            label="Intent"
-            placeholder="Enter the intent summary"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            multiline
-            minRows={2}
-            value={masIntent}
-            onChange={(e) => setMasIntent(e.target.value)}
-          />
+          <Stack direction="column" sx={{ gap: "16px" }}>
+            <InputField
+              autoFocus
+              label="MAS Name"
+              placeholder="Enter a name for the MAS"
+              autoComplete="off"
+              fullWidth
+              value={masName}
+              onChange={(e) => {
+                setMasName(e.target.value);
+                setSaveError("");
+              }}
+            />
+            <InputField
+              label="Description"
+              placeholder="Enter a description"
+              autoComplete="off"
+              fullWidth
+              multiline
+              minRows={2}
+              value={masDescription}
+              onChange={(e) => setMasDescription(e.target.value)}
+            />
+            <InputField
+              label="Intent"
+              placeholder="Enter the intent summary"
+              autoComplete="off"
+              fullWidth
+              multiline
+              minRows={2}
+              value={masIntent}
+              onChange={(e) => setMasIntent(e.target.value)}
+            />
+          </Stack>
         </DialogContent>
         <DialogActions>
           <Button onClick={handleCloseSaveDialog}>Cancel</Button>
-          <Button variant="primary" onClick={handleSave} disabled={isSaving}>
+          <Button variant="gradient" onClick={handleSave} disabled={isSaving}>
             {isSaving ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
       </Dialog>
+      <CreateItemDialog
+        open={copyOpen}
+        kind="application"
+        scopeId={library ?? ""}
+        copyFrom={id ? { scopeId: library ?? "", itemId: id } : undefined}
+        onClose={() => setCopyOpen(false)}
+        onCreated={(sid, createdId) =>
+          navigate(scopeHref(sid, `/applications/${encodeURIComponent(createdId)}`))
+        }
+      />
     </PageWithTitle>
   );
 };

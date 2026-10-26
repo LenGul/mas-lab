@@ -7,34 +7,32 @@ import {
   CanvasBuilder,
 } from "@/components";
 import type { YamlOutputMap } from "@/components/CanvasBuilder/types";
-import {
-  Box,
-  Stack,
-  Typography,
-  useTheme,
-  Tabs,
-  Tab,
-  Button,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  TextField,
-  Alert,
-} from "@mui/material";
+import { Box, Stack, Typography, useTheme, Alert } from "@mui/material";
 import { useLocation, useNavigate, useParams } from "react-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { parse, stringify } from "yaml";
 import { validateManifests } from "@/utils/manifestValidator";
 import { useValidateAgent, useValidateMas, createMasResource } from "@/api/apiCalls";
 import { useQueryClient } from "@tanstack/react-query";
+import { useScopeId } from "@/api/scope";
+import {
+  Button,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  InputField,
+  Tab,
+  Tabs,
+} from "@open-ui-kit/core";
 
 const PLAYGROUND_TAB_KEYS = ["graph", "yaml"] as const;
 type PlaygroundTab = (typeof PLAYGROUND_TAB_KEYS)[number];
 
 const Playground = () => {
   const theme = useTheme();
-  const { playgroundTab, library } = useParams();
+  const library = useScopeId();
+  const { playgroundTab } = useParams();
   const queryClient = useQueryClient();
 
   const [yamlOutputMap, setYamlOutputMap] = useState<YamlOutputMap>({});
@@ -372,9 +370,7 @@ const Playground = () => {
                         : theme.palette.info.main,
                   }}
                 >
-                  {key === "mas"
-                    ? "mas.yaml"
-                    : `${key.replace("agent:", "")}.agent.yaml`}
+                  {key === "mas" ? "application" : key}
                 </Typography>
                 <CodeBlock code={yamlOutputMap[key]} language="yaml" />
               </Box>
@@ -396,48 +392,44 @@ const Playground = () => {
               {saveError}
             </Alert>
           )}
-          <TextField
-            autoFocus
-            margin="dense"
-            label="MAS Name"
-            placeholder="Enter a name for the MAS"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            value={masName}
-            onChange={(e) => {
-              setMasName(e.target.value);
-              setSaveError("");
-            }}
-          />
-          <TextField
-            margin="dense"
-            label="Description"
-            placeholder="Enter a description"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            multiline
-            minRows={2}
-            value={masDescription}
-            onChange={(e) => setMasDescription(e.target.value)}
-          />
-          <TextField
-            margin="dense"
-            label="Intent"
-            placeholder="Enter the intent summary"
-            variant="standard"
-            autoComplete="off"
-            fullWidth
-            multiline
-            minRows={2}
-            value={masIntent}
-            onChange={(e) => setMasIntent(e.target.value)}
-          />
+          <Stack direction="column" sx={{ gap: "16px" }}>
+            <InputField
+              autoFocus
+              label="MAS Name"
+              placeholder="Enter a name for the MAS"
+              autoComplete="off"
+              fullWidth
+              value={masName}
+              onChange={(e) => {
+                setMasName(e.target.value);
+                setSaveError("");
+              }}
+            />
+            <InputField
+              label="Description"
+              placeholder="Enter a description"
+              autoComplete="off"
+              fullWidth
+              multiline
+              minRows={2}
+              value={masDescription}
+              onChange={(e) => setMasDescription(e.target.value)}
+            />
+            <InputField
+              label="Intent"
+              placeholder="Enter the intent summary"
+              autoComplete="off"
+              fullWidth
+              multiline
+              minRows={2}
+              value={masIntent}
+              onChange={(e) => setMasIntent(e.target.value)}
+            />
+          </Stack>
         </DialogContent>
         <DialogActions>
           <Button onClick={handleCloseSaveDialog}>Cancel</Button>
-          <Button variant="primary" onClick={handleSave} disabled={isSaving}>
+          <Button variant="gradient" onClick={handleSave} disabled={isSaving}>
             {isSaving ? "Saving..." : "Save"}
           </Button>
         </DialogActions>

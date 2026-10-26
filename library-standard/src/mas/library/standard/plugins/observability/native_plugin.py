@@ -1,18 +1,28 @@
 #  Copyright (c) 2026 Cisco Systems, Inc. and its affiliates
 #  SPDX-License-Identifier: Apache-2.0
-"""NativeObservabilityPlugin — read-mode export: TransitionEvent → events.jsonl."""
+"""NativeObservabilityPlugin — read-mode export: TransitionEvent → events.jsonl + EventStream."""
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from mas.library.standard.lib.observability.emit import EventEmitter, FanOutEmitter
+from mas.library.standard.lib.observability.emit import (
+    EventEmitter,
+    FanOutEmitter,
+    JsonlFileEmitter,
+    StdoutJsonlEmitter,
+)
 from mas.library.standard.lib.observability.native.emit_transition import project_transition
 from mas.library.standard.lib.observability.native.transform import NativeObservabilityTransform, TransformContext
+from mas.runtime.boundary.obs.event_stream import publish_event
 from mas.runtime.boundary.obs.observability_plugin import ObservabilityPlugin
 from mas.runtime.boundary.obs.binding import ObservabilityBinding
 from mas.runtime.boundary.obs.transition import TransitionEvent
+
+_logger = logging.getLogger(__name__)
 
 
 def _parse_categories(raw: object) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -64,6 +74,12 @@ class NativeObservabilityPlugin(ObservabilityPlugin):
         if self.emitters:
             self._fanout = FanOutEmitter(*self.emitters)
 
+    def events_jsonl_path(self) -> Path | None:
+        for emitter in self.emitters:
+            if isinstance(emitter, JsonlFileEmitter):
+                return Path(emitter.path)
+        return None
+
     def _ctx_for(self, agent_id: str) -> TransformContext:
         """Per-agent TransformContext.
 
@@ -104,8 +120,6 @@ class NativeObservabilityPlugin(ObservabilityPlugin):
             return ctx
 
     def on_transition(self, event: TransitionEvent) -> None:
-        if self._fanout is None:
-            return
         ctx = self._ctx_for(event.agent_id)
         for rec in project_transition(
             event,
@@ -115,8 +129,14 @@ class NativeObservabilityPlugin(ObservabilityPlugin):
             session_id=event.session_id or self.session_id,
             task_id=event.task_id,
         ):
-            if self._category_allowed(rec):
+            if not self._category_allowed(rec):
+                continue
+            if self._fanout is not None:
                 self._fanout.emit(rec)
+            try:
+                publish_event(rec)
+            except Exception:
+                _logger.debug("event stream publish failed", exc_info=True)
         # Propagate run-global MAS call id back to the shared base so contexts
         # created for other agents afterwards inherit it (mas_call_start is
         # emitted on the "mas" pseudo-agent, before sub-agent contexts exist).
@@ -154,10 +174,6 @@ class NativeObservabilityPlugin(ObservabilityPlugin):
         base_dir: str | Path,
         agent_id: str,
     ) -> "NativeObservabilityPlugin":
-        from pathlib import Path
-
-        from mas.library.standard.lib.observability.emit import JsonlFileEmitter, StdoutJsonlEmitter
-
         base_path = Path(base_dir)
         native_cfg = binding.plugin_configs.get("native") or {}
         events_path = Path(binding.events_file) if binding.events_file else base_path / "traces" / "events.jsonl"

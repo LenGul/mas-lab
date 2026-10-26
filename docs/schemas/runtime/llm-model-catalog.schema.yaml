@@ -1,7 +1,7 @@
 #  Copyright (c) 2026 Cisco Systems, Inc. and its affiliates
 #  SPDX-License-Identifier: Apache-2.0
 $schema: "https://json-schema.org/draft-07/schema#"
-$id: "https://outshift-open.github.io/mas-lab/schemas/runtime/llm-model-catalog.schema.yaml"
+$id: "mas/v1#llm-model-catalog"
 title: LlmModelCatalog
 description: >
   Versioned per-model capability table (context window, max output, defaults,
@@ -93,6 +93,26 @@ definitions:
         items:
           type: string
           enum: [chat_completions, responses, ollama, vllm, anthropic, gemini]
+      pricing:
+        type: object
+        description: USD price per million tokens, used for cost estimates.
+        additionalProperties: false
+        properties:
+          currency:
+            type: string
+          input_per_million_tokens:
+            type: number
+            minimum: 0
+          cached_input_per_million_tokens:
+            type: number
+            minimum: 0
+          output_per_million_tokens:
+            type: number
+            minimum: 0
+          source:
+            type: string
+          checked_at:
+            type: string
       defaults:
         type: object
         additionalProperties: true

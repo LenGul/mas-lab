@@ -9,13 +9,12 @@ import logging
 import os
 import signal
 import socket
-import sys
 import threading
 from pathlib import Path
 from typing import Any
 
-from mas.lab.controller.api import ControllerAPI
 from mas.lab.controller import config as cfg
+from mas.lab.controller.api import ControllerAPI, set_controller_api
 from mas.lab.controller.config import DEFAULT_HTTP_PORT, ensure_mas_dirs
 from mas.lab.controller.sessions import SessionRegistry
 
@@ -28,11 +27,11 @@ _code_fingerprint: str | None = None
 _env_fingerprint: dict[str, str] | None = None
 
 
-def _serve_http(*, host: str, port: int) -> None:
+def _serve_http(*, host: str, port: int, settings=None) -> None:
     import uvicorn
+    from mas.lab.controller.fastapi_app import create_app
 
-    from mas.lab.controller.fastapi_app import app
-
+    app = create_app(settings) if settings is not None else create_app()
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
@@ -110,10 +109,28 @@ def _serve_socket(path: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MAS Lab controller daemon")
     parser.add_argument("--port", type=int, default=int(os.environ.get("MAS_CONTROLLER_PORT", DEFAULT_HTTP_PORT)))
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--socket", type=Path, default=None)
     parser.add_argument("--no-http", action="store_true")
+    parser.add_argument("--cors-origin", action="append", default=[])
+    parser.add_argument("--token-file", type=Path, default=None)
+    parser.add_argument("--state-dir", type=Path, default=None)
+    parser.add_argument("--workspace", type=Path, default=None)
     args = parser.parse_args(argv)
+    if args.workspace is not None:
+        os.environ["MAS_WORKSPACE_ROOT"] = str(Path(args.workspace).expanduser().resolve())
     socket = args.socket or cfg.socket_path()
+
+    from mas.lab.controller.settings import ControllerSettings, load_token_file
+
+    token = load_token_file(args.token_file) if args.token_file else None
+    http_settings = ControllerSettings(
+        host=args.host,
+        port=args.port,
+        cors_origins=list(args.cors_origin or []),
+        token=token,
+        state_dir=args.state_dir or (cfg.controller_dir() / "state"),
+    )
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     ensure_mas_dirs()
@@ -128,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         workspace = None
     _api = ControllerAPI(workspace)
+    set_controller_api(_api)
 
     cfg.pid_path().write_text(str(os.getpid()), encoding="utf-8")
 
@@ -145,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         threads.append(
             threading.Thread(
                 target=_serve_http,
-                kwargs={"host": "127.0.0.1", "port": args.port},
+                kwargs={"host": args.host, "port": args.port, "settings": http_settings},
                 daemon=True,
                 name="http",
             )

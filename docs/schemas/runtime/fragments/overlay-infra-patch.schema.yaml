@@ -13,6 +13,8 @@ title: OverlayInfraPatch
 # already-typed declaration.
 type: object
 additionalProperties: false
+allOf:
+  - $ref: "./infra-middleware-params-by-id.schema.yaml"
 properties:
   entries:
     $ref: "../infra.schema.yaml#/properties/spec/properties/entries"
@@ -20,6 +22,8 @@ properties:
     $ref: "../infra.schema.yaml#/properties/spec/properties/includes"
   interceptors:
     $ref: "../infra.schema.yaml#/properties/spec/properties/interceptors"
+  runtime_engine:
+    $ref: "../infra.schema.yaml#/properties/spec/properties/runtime_engine"
   middleware:
     $ref: "../infra.schema.yaml#/properties/spec/properties/middleware"
   applies_to:
@@ -42,6 +46,8 @@ properties:
     $ref: "../infra.schema.yaml#/properties/spec/properties/token_refs"
   stores:
     $ref: "../infra.schema.yaml#/properties/spec/properties/stores"
+  services:
+    $ref: "../infra.schema.yaml#/properties/spec/properties/services"
   provider:
     $ref: "../infra.schema.yaml#/properties/spec/properties/provider"
   params:

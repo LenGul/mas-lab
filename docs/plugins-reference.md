@@ -4,7 +4,7 @@
 > **Auto-generated** from `pyproject.toml` files and `library.yaml` manifests.  Run `task docs-gen` to refresh after adding or modifying packages.
 
 This document is the canonical index of all plugins, tools, and flavours
-distributed in `outshift-open/mas-lab`.  Each entry links back to the
+distributed in `ioc-project/mas-lab`.  Each entry links back to the
 package that provides it.
 
 ---
@@ -21,8 +21,8 @@ plugins:
 
 Or by short name when using a flavour that already activates it.
 
-See [flavours documentation](../library-standard/docs/user-guide.md) and
-[Tutorial 2 — Creating a MAS](tutorials/02-creating-a-mas/) for
+See [flavours documentation](https://github.com/ioc-project/mas-lab/blob/main/library-standard/docs/user-guide.md) and
+[Tutorial 2 — Creating a MAS](tutorials/02-creating-a-mas/README.md) for
 practical examples.
 
 ---
@@ -133,10 +133,11 @@ practical examples.
 
 ### Infra_Middleware
 
-| Class                   | Full module path                                  | Package                |
-| ----------------------- | ------------------------------------------------- | ---------------------- |
-| `FaultInjectMiddleware` | `mas.library.standard.plugins.infra.fault_inject` | `mas-library-standard` |
-| `LlmCacheMiddleware`    | `mas.library.standard.plugins.infra.llm_cache`    | `mas-library-standard` |
+| Class                    | Full module path                                   | Package                |
+| ------------------------ | -------------------------------------------------- | ---------------------- |
+| `FaultInjectMiddleware`  | `mas.library.standard.plugins.infra.fault_inject`  | `mas-library-standard` |
+| `LlmCacheMiddleware`     | `mas.library.standard.plugins.infra.llm_cache`     | `mas-library-standard` |
+| `LlmSchedulerMiddleware` | `mas.library.standard.plugins.infra.llm_scheduler` | `mas-library-standard` |
 
 ### Llm_Provider
 
@@ -285,6 +286,7 @@ practical examples.
 | `ListClickhouseSessionsStep`     | step                 | `mas-library-telemetry` |
 | `LlmCacheMiddleware`             | infra_middleware     | `mas-library-standard`  |
 | `LlmDelegator`                   | engine_tool_provider | `mas-library-standard`  |
+| `LlmSchedulerMiddleware`         | infra_middleware     | `mas-library-standard`  |
 | `LlmSummarizer`                  | summarizer           | `mas-library-standard`  |
 | `LocalAgentComm`                 | agent_comm           | `mas-library-standard`  |
 | `LocalToolProvider`              | tool_provider        | `mas-library-standard`  |

@@ -21,6 +21,11 @@ except ImportError:  # pragma: no cover
     _yaml = None  # type: ignore[assignment]
 from datetime import datetime
 
+from mas.lab.benchmark.pipeline.artifact_paths import (
+    check_simple_name,
+    resolve_step_root,
+    validate_step_config_paths,
+)
 from mas.lab.benchmark.pipeline.core import Pipeline, PipelineStep
 from mas.lab.benchmark.pipeline.models import StepOutput
 from mas.lab.benchmark.pipeline.resolver import DependencyResolver
@@ -37,6 +42,20 @@ from mas.runtime.constants import LAB_CONFIG_FILENAME
 
 
 logger = logging.getLogger(__name__)
+
+
+def _republish_cached_output(step_name: str, output: Any) -> None:
+    """Reinject a restored artefact onto the live channel so downstream / UI see it."""
+    try:
+        from mas.lab.benchmark.pipeline.channel import get_channel
+        from mas.lab.benchmark.pipeline.fanout import publish_output_stream
+
+        channel = get_channel()
+        if channel is None or output is None:
+            return
+        publish_output_stream(channel, step_name, output)
+    except Exception:
+        logger.debug("cached republish skipped for %s", step_name, exc_info=True)
 
 
 def is_fatal_pipeline_error(exc: BaseException) -> bool:
@@ -336,10 +355,12 @@ class ExecutionContext:
         sc = self.scope_context
         if sc.scenario and sc.test and sc.run:
             return self.output_dir / sc.scenario / sc.test / sc.run
+        check_simple_name(step_name, "name", step_name)
         return self.output_dir / "data" / step_name
     
     def get_step_log_dir(self, step_name: str) -> Path:
         """Get log directory for a step."""
+        check_simple_name(step_name, "name", step_name)
         return self.output_dir / "logs" / step_name
 
 
@@ -575,6 +596,11 @@ class PipelineExecutor:
         start_time = datetime.now()
         force_rerun = set(force_rerun or [])
         execution_order = self.resolver.resolve(steps)
+        # Run start: a step may only name locations inside its level's folder.
+        for _step in self.pipeline.steps:
+            _step.config = validate_step_config_paths(
+                _step.name, _step.config, framework_injected=True, step_type=_step.type
+            )
         ctx = ExecutionContext(
             pipeline=self.pipeline,
             output_dir=self.output_dir,
@@ -642,12 +668,16 @@ class PipelineExecutor:
             if restored is not None:
                 restored.metadata["cached"] = True
                 ctx.step_outputs[step_name] = restored
+                _republish_cached_output(step_name, restored)
                 continue
             data: dict = {}
             files: list = []
             failed = False
             for data_key, artifact in artifacts:
                 path = getattr(artifact, "_resolved_path", None)
+                rel = getattr(artifact, "_relative_path", None)
+                if path is None and rel:
+                    path = resolve_step_root(ctx, step.config, step=step_name) / rel
                 if path is None:
                     path = artifact.resolve_path(ctx)
                 value = artifact.load(path)
@@ -662,9 +692,11 @@ class PipelineExecutor:
                 steps_to_rerun.append(step_name)
             else:
                 from mas.lab.benchmark.pipeline import StepOutput as _SO
-                ctx.step_outputs[step_name] = _SO(
+                restored_files = _SO(
                     data=data, files=files, metadata={"cached": True}
                 )
+                ctx.step_outputs[step_name] = restored_files
+                _republish_cached_output(step_name, restored_files)
         type_totals: Dict[str, int] = {}
         for step_name in steps_to_rerun:
             step = self.pipeline.get_step(step_name)
@@ -967,7 +999,11 @@ class PipelineExecutor:
                 return [_substitute(item) for item in value]
             return value
 
-        return _substitute(config)  # type: ignore[return-value]
+        # --var values may have introduced an escaping path: re-check once resolved.
+        return validate_step_config_paths(
+            ctx.current_step or "?", _substitute(config), framework_injected=True, warn=False,
+            step_type=getattr(ctx.pipeline.get_step(ctx.current_step), "type", None),
+        )
 
     def plan(
         self,

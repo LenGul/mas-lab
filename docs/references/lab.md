@@ -4,16 +4,20 @@
 -->
 # Lab package documentation
 
-Benchmark engine, pipeline steps, and experiment design docs live next to the
-`mas-lab` package.
+This page lists where the `mas-lab` package keeps its own docs: the benchmark engine, pipeline steps, and experiment design. Read it when you run experiments.
 
 | Topic | Path in repository |
 |-------|-------------------|
-| Lab package index | [`lab/docs/index.md`](https://github.com/outshift-open/mas-lab/blob/main/lab/docs/index.md) |
-| Benchmarking | [`lab/docs/benchmark.md`](https://github.com/outshift-open/mas-lab/blob/main/lab/docs/benchmark.md) |
-| Designing experiments | [`lab/docs/designing-experiments.md`](https://github.com/outshift-open/mas-lab/blob/main/lab/docs/designing-experiments.md) |
-| Pipeline steps | [`lab/docs/pipeline-steps.md`](https://github.com/outshift-open/mas-lab/blob/main/lab/docs/pipeline-steps.md) |
-| Labs quickstart | [`lab/docs/labs-quickstart.md`](https://github.com/outshift-open/mas-lab/blob/main/lab/docs/labs-quickstart.md) |
+| Lab package index | [`lab/docs/index.md`](https://github.com/ioc-project/mas-lab/blob/main/lab/docs/index.md) |
+| Benchmarking | [`lab/docs/benchmark.md`](https://github.com/ioc-project/mas-lab/blob/main/lab/docs/benchmark.md) |
+| Designing experiments | [`lab/docs/designing-experiments.md`](https://github.com/ioc-project/mas-lab/blob/main/lab/docs/designing-experiments.md) |
+| Pipeline steps | [`lab/docs/pipeline-steps.md`](https://github.com/ioc-project/mas-lab/blob/main/lab/docs/pipeline-steps.md) |
+| Labs quickstart | [`lab/docs/labs-quickstart.md`](https://github.com/ioc-project/mas-lab/blob/main/lab/docs/labs-quickstart.md) |
 
-YAML field reference for experiments, datasets, and pipelines:
-[Specifications](index.md#lab-benchmarks).
+For the YAML fields of experiments, datasets, and pipelines, see [Lab](index.md#lab).
+
+## See also
+
+- [Tutorial 3: experiments and analysis](../tutorials/03-experiments-and-analysis/README.md)
+- [Experiment manifest](../manifests/experiment.md)
+- [Runtime package documentation](runtime.md)

@@ -50,6 +50,9 @@ properties:
         type: string
         description: "Namespace scope for the overlay (global or app name). Defaults to global."
         default: "global"
+      x-namespace:
+        type: string
+        description: "UI namespace hint (global or application id). Ignored by the runtime."
 
   spec:
     type: object
@@ -106,8 +109,8 @@ properties:
       overrides:
         type: array
         description: >
-          Ordered root-qualified path assignments applied after patch. Uses the
-          same selector and wildcard syntax as the CLI --override option.
+          Ordered session-tree path assignments applied after patch. Uses the
+          same type/id selector syntax as the CLI --override option.
         items:
           type: string
 

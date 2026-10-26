@@ -1,7 +1,6 @@
 //  Copyright (c) 2026 Cisco Systems, Inc. and its affiliates
 //  SPDX-License-Identifier: Apache-2.0
 import { PageWithTitle } from "@/components";
-import { parse } from "yaml";
 import {
   MaterialReactTable,
   MRT_RowSelectionState,
@@ -32,20 +31,22 @@ import {
   DialogContentText,
   DialogActions,
 } from "@mui/material";
-import { useNavigate, useParams } from "react-router";
+import { useNavigate } from "react-router";
+import { useScopeId, scopeHref } from "@/api/scope";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   usePipelines,
   deletePipeline,
   runPipeline,
   pollJob,
-  fetchJobs,
-  fetchJobDetail,
 } from "@/api/apiCalls";
 import type { PipelineSummary } from "@/api/apiCalls";
 import { useQueryClient } from "@tanstack/react-query";
-import { GLOBAL_BACKGROUND_COLOR } from "@/common/styles";
+import { CreateItemDialog } from "@/components/CreateItemDialog";
+import { fetchRuns } from "@/api/runs";
 import { ScrollableTooltip } from "@/components/ScrollableTooltip";
+
+const TABLE_BG = "transparent";
 
 interface PipelineJobStatus {
   jobId: string;
@@ -55,7 +56,8 @@ interface PipelineJobStatus {
     | "completed"
     | "failed"
     | "cancelled"
-    | "timeout";
+    | "timeout"
+    | "interrupted";
   stdout?: string;
   stderr?: string;
 }
@@ -67,11 +69,12 @@ const POLL_INTERVAL = 2000;
 const Pipelines = () => {
   const theme = useTheme();
   const navigate = useNavigate();
-  const { library = "" } = useParams<{ library: string }>();
+  const library = useScopeId();
   const queryClient = useQueryClient();
 
   const { data: pipelines, isLoading } = usePipelines(library);
 
+  const [createOpen, setCreateOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [pendingDeleteNames, setPendingDeleteNames] = useState<string[]>([]);
   const [rowSelection, setRowSelection] = useState<MRT_RowSelectionState>({});
@@ -139,107 +142,35 @@ const Pipelines = () => {
 
   useEffect(() => {
     const recoverJobs = async () => {
-      if (!pipelines || pipelines.length === 0) return;
-
       try {
-        const allJobs = [
-          ...(await fetchJobs("pending")),
-          ...(await fetchJobs("running")),
-          ...(await fetchJobs("completed")),
-          ...(await fetchJobs("failed")),
-        ];
-
-        const pipelineJobs = allJobs
-          .filter(
-            (j) =>
-              j.endpoint?.includes("/pipeline/run") &&
-              j.endpoint?.includes(library),
-          )
-          .sort(
-            (a, b) =>
-              new Date(b.created_at).getTime() -
-              new Date(a.created_at).getTime(),
-          );
-
-        const filenameToName = new Map<string, string>();
-        for (const p of pipelines) {
-          filenameToName.set(p.filename, p.name);
-        }
-
+        const runs = (await fetchRuns()).filter((r) => r.kind === "pipeline");
         const seen = new Set<string>();
-        for (const job of pipelineJobs) {
-          const detail = await fetchJobDetail(job.id);
-          const body = detail.request_body as
-            | Record<string, unknown>
-            | undefined;
-
-          let pipelineName = "";
-
-          if (body?.name && typeof body.name === "string") {
-            pipelineName = body.name;
-          } else if (
-            body?.pipeline_yaml &&
-            typeof body.pipeline_yaml === "string"
-          ) {
-            const pipelineYamlValue = body.pipeline_yaml as string;
-            // check if the pipeline YAML is a valid YAML document
-            if (
-              pipelineYamlValue.includes("\n") ||
-              pipelineYamlValue.includes("api_version")
-            ) {
-              try {
-                const doc = parse(pipelineYamlValue);
-                pipelineName = doc?.metadata?.name || "";
-              } catch {
-                /* ignore */
-              }
-            } else {
-              const filename = pipelineYamlValue.split("/").pop() || "";
-              if (filename) {
-                pipelineName = filenameToName.get(filename) || "";
-              }
-            }
-          }
-
-          if (!pipelineName && body?.content) {
-            try {
-              const doc = parse(body.content as string);
-              pipelineName = doc?.metadata?.name || "";
-            } catch {
-              /* ignore */
-            }
-          }
-
-          if (!pipelineName) continue;
-
-          if (seen.has(pipelineName)) continue;
+        for (const run of runs) {
+          const pipelineName = run.item;
+          if (!pipelineName || seen.has(pipelineName)) continue;
           seen.add(pipelineName);
-
           const isTerminal =
-            job.status === "completed" ||
-            job.status === "failed" ||
-            job.status === "cancelled" ||
-            job.status === "timeout";
-
+            run.status === "completed" ||
+            run.status === "failed" ||
+            run.status === "cancelled" ||
+            run.status === "timeout";
           if (isTerminal) {
             setRunningJobs((prev) => ({
               ...prev,
               [pipelineName]: {
-                jobId: job.id,
-                status: job.status as PipelineJobStatus["status"],
-                stdout: detail.stdout || undefined,
-                stderr: detail.stderr || undefined,
+                jobId: run.id,
+                status: run.status as PipelineJobStatus["status"],
               },
             }));
           } else if (!pollTimers.current[pipelineName]) {
             setRunningJobs((prev) => ({
               ...prev,
               [pipelineName]: {
-                jobId: job.id,
-                status: job.status as PipelineJobStatus["status"],
+                jobId: run.id,
+                status: run.status as PipelineJobStatus["status"],
               },
             }));
-            startPolling(pipelineName, job.id);
+            startPolling(pipelineName, run.id);
           }
         }
       } catch {
@@ -248,20 +179,21 @@ const Pipelines = () => {
     };
 
     if (library) recoverJobs();
-  }, [library, pipelines, startPolling]);
+    const timer = window.setInterval(() => {
+      if (library) void recoverJobs();
+    }, POLL_INTERVAL);
+    return () => window.clearInterval(timer);
+  }, [library, startPolling]);
 
   const handleRun = useCallback(
-    async (name: string, filename: string) => {
+    async (name: string) => {
       setRunningJobs((prev) => ({
         ...prev,
         [name]: { jobId: "", status: "pending" },
       }));
 
       try {
-        const { job_id } = await runPipeline(library, {
-          pipeline_yaml: `pipelines/${filename}`,
-          timeout: 1200,
-        });
+        const { job_id } = await runPipeline(library, name);
         setRunningJobs((prev) => ({
           ...prev,
           [name]: { jobId: job_id, status: "running" },
@@ -304,7 +236,7 @@ const Pipelines = () => {
               }}
               onClick={() =>
                 navigate(
-                  `/${library}/pipelines/${encodeURIComponent(row.name)}`,
+                  scopeHref(library, `/pipelines/${encodeURIComponent(row.name)}`),
                 )
               }
             >
@@ -336,17 +268,13 @@ const Pipelines = () => {
         accessorKey: "experiment",
         header: "Experiment",
         size: 180,
-        accessorFn: (row) => {
-          if (!row.experiment) return "—";
-          const match = row.experiment.match(/labs\/([^/]+)/);
-          return match ? match[1] : row.experiment;
-        },
+        accessorFn: (row) => row.experiment || "—",
       },
       {
         id: "step_count",
         header: "Steps",
         size: 80,
-        accessorFn: (row) => row.steps.length,
+        accessorFn: (row) => row.steps?.length ?? 0,
       },
       {
         id: "status",
@@ -510,7 +438,7 @@ const Pipelines = () => {
           key="run"
           disabled={isRunning}
           onClick={() => {
-            handleRun(row.original.name, row.original.filename);
+            handleRun(row.original.name);
             closeMenu();
           }}
         >
@@ -553,25 +481,25 @@ const Pipelines = () => {
     muiTableBodyRowProps: () => ({
       sx: {
         cursor: "pointer",
-        backgroundColor: GLOBAL_BACKGROUND_COLOR,
+        backgroundColor: TABLE_BG,
         "& > td": {
-          backgroundColor: `${GLOBAL_BACKGROUND_COLOR} !important`,
+          backgroundColor: `${TABLE_BG} !important`,
         },
       },
     }),
     muiTablePaperProps: {
       sx: {
         padding: 0,
-        backgroundColor: GLOBAL_BACKGROUND_COLOR,
+        backgroundColor: TABLE_BG,
         elevation: 0,
       },
     },
     muiTableHeadCellProps: {
-      sx: { backgroundColor: GLOBAL_BACKGROUND_COLOR, color: "#ffffff" },
+      sx: { backgroundColor: TABLE_BG, color: "#ffffff" },
     },
     muiTableBodyCellProps: {
       sx: {
-        backgroundColor: GLOBAL_BACKGROUND_COLOR,
+        backgroundColor: TABLE_BG,
         color: "#ffffff",
         height: "40px",
       },
@@ -613,9 +541,7 @@ const Pipelines = () => {
             >
               Pipelines
             </Typography>
-            <Button onClick={() => navigate(`/${library}/pipelines/new`)}>
-              Add Pipeline
-            </Button>
+            <Button onClick={() => setCreateOpen(true)}>Add Pipeline</Button>
           </Stack>
         }
       >
@@ -644,6 +570,15 @@ const Pipelines = () => {
           </Button>
         </DialogActions>
       </Dialog>
+      <CreateItemDialog
+        open={createOpen}
+        kind="pipeline"
+        scopeId={library}
+        onClose={() => setCreateOpen(false)}
+        onCreated={(sid, id) =>
+          navigate(scopeHref(sid, `/pipelines/${encodeURIComponent(id)}`))
+        }
+      />
     </Box>
   );
 };

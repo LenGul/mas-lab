@@ -712,7 +712,7 @@ def export_command(args) -> int:
         "benchmark_id": metadata.benchmark_id,
         "short_id": metadata.short_id,
         "experiment_name": metadata.experiment_name,
-        "experiment_yaml_path": metadata.experiment_yaml_path,
+        # "experiment_yaml_path": metadata.experiment_yaml_path,
         "experiment_yaml_archive_path": source_bundle["experiment_yaml_archive_path"],
         "run_dir_basename": run_dir.name,
         "has_trace_cache": bool(trace_dirs),

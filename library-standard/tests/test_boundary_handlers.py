@@ -55,7 +55,27 @@ def test_hitl_resolve_carries_resolution_and_answer() -> None:
         "agent_id": "moderator", "run_id": "run-1", "correlation_id": 5,
         "timestamp": out[0]["timestamp"],
         "resolution": "approved", "answer": "yes, proceed",
+        "operator_id": "",
+        "steering": "",
     }]
+
+
+def test_hitl_resolve_carries_operator_id_and_steering() -> None:
+    record = {
+        "kind": "hitl.resolve",
+        "correlation_id": 5,
+        "actor_id": "cli-operator",
+        "payload": {
+            "resolution": "SKIP",
+            "answer": None,
+            "operator_id": "cli-operator",
+            "steering": "Do not calculate this yourself.",
+        },
+    }
+    out = dispatch_boundary(record, ctx=_ctx())
+    assert out[0]["operator_id"] == "cli-operator"
+    assert out[0]["steering"] == "Do not calculate this yourself."
+    assert out[0]["resolution"] == "SKIP"
 
 
 def test_governance_decision_carries_reason_and_policy_name() -> None:
@@ -136,6 +156,7 @@ def test_context_assembled_emits_processing_span_and_context_event() -> None:
             "context_usage": {
                 "context_window": 256000,
                 "estimated_prompt_tokens": 250,
+                "archive_view_id": "viewdeadbeef",
                 "context_parts": [{"source": "skills", "pinned": True, "tokens": 80}],
             },
         },
@@ -150,6 +171,7 @@ def test_context_assembled_emits_processing_span_and_context_event() -> None:
     assert assembled["tools"] == ["get_logs", "get_metrics"]
     assert assembled["context_usage"]["context_window"] == 256000
     assert assembled["context_usage"]["context_parts"][0]["pinned"] is True
+    assert assembled["archive_view_id"] == "viewdeadbeef"
 
     pstart = next(ev for ev in out if ev.get("kind") == "processing_call_start")
     pend = next(ev for ev in out if ev.get("kind") == "processing_call_end")
@@ -157,6 +179,8 @@ def test_context_assembled_emits_processing_span_and_context_event() -> None:
     assert pstart["context_operation"] == "PREPEND"
     assert pstart.get("parent_call_id") == "exec-1"
     assert pstart["call_id"] == pend["call_id"]
+    assert pstart["archive_view_id"] == "viewdeadbeef"
+    assert pend["archive_view_id"] == "viewdeadbeef"
 
 
 def test_cache_lookup_projects_without_creating_llm_completion() -> None:

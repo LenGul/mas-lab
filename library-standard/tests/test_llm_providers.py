@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
-
 from mas.library.standard.plugins.llm.cache import CacheLLMProvider
 from mas.library.standard.plugins.llm.openai import OpenAILLMProvider
 from mas.runtime.registry.llm_provider_registry import (
@@ -167,9 +167,7 @@ def test_cache_provider_read_hit_skips_inner(tmp_path) -> None:
 
 def test_cache_provider_persists_tool_calls(tmp_path) -> None:
     cache_path = tmp_path / "llm-cache.json"
-    tool_calls = [
-        {"id": "call_1", "type": "function", "function": {"name": "demo_tool", "arguments": "{}"}}
-    ]
+    tool_calls = [{"id": "call_1", "type": "function", "function": {"name": "demo_tool", "arguments": "{}"}}]
     writer = CacheLLMProvider(
         _StubInner({"role": "assistant", "content": None, "tool_calls": tool_calls, "usage": {"total_tokens": 12}}),
         cache_path=cache_path,
@@ -222,6 +220,9 @@ class _FakeClient:
         assert method == "POST"
         return _FakeStreamResponse(self._lines)
 
+    def close(self) -> None:
+        return None
+
     def __enter__(self) -> "_FakeClient":
         return self
 
@@ -251,6 +252,55 @@ def test_openai_provider_streams_content_chunks(monkeypatch) -> None:
     assert received == ["Hel", "lo"]
     assert message["content"] == "Hello"
     assert message["finish_reason"] == "stop"
+
+
+def test_openai_provider_stream_skips_noise_and_accumulates_tool_calls(monkeypatch) -> None:
+    def _boom(text: str) -> None:
+        if text == "x":
+            raise RuntimeError("callback")
+
+    lines = [
+        "event: ping",
+        b"data: not-json",
+        "data: ",
+        _sse({"usage": {"prompt_tokens": 1}, "choices": []}),
+        _sse({"choices": [{"delta": {"content": "x"}}]}),
+        _sse(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [{"index": 0, "id": "c1", "function": {"name": "lookup", "arguments": "{"}}]
+                        }
+                    }
+                ]
+            }
+        ),
+        _sse(
+            {
+                "choices": [
+                    {
+                        "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]},
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+        ),
+        "data: [DONE]",
+    ]
+    monkeypatch.setattr("httpx.Client", lambda **kwargs: _FakeClient(lines, **kwargs))
+    message = OpenAILLMProvider(stream=True).chat_completion(
+        model="gpt",
+        messages=[{"role": "user", "content": "hi"}],
+        api_key="k",
+        on_stream_chunk=_boom,
+    )
+    assert message["content"] == "x"
+    assert message["usage"] == {"prompt_tokens": 1}
+    assert message["finish_reason"] == "tool_calls"
+    assert message["tool_calls"] == [
+        {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+    ]
 
 
 class _FakePostResponse:
@@ -283,6 +333,9 @@ class _FakePostClient:
             headers=kwargs.get("headers"),
             params=kwargs.get("params"),
         )
+
+    def close(self) -> None:
+        return None
 
     def __enter__(self) -> "_FakePostClient":
         return self
@@ -409,6 +462,231 @@ def test_openai_provider_default_exclude_strips_without_sending_extension(monkey
     assert "reasoning_content" not in out
 
 
+class _FlakyPostClient:
+    """Raises a transport error the first `fail_times` calls, then succeeds."""
+
+    def __init__(self, message: dict, *, fail_times: int = 0, exc_factory=None, **_: object) -> None:
+        self._message = message
+        self._fail_times = fail_times
+        self._exc_factory = exc_factory or (lambda: httpx.ConnectError("boom"))
+        self.calls = 0
+
+    def post(self, url: str, json: object, headers: object, params: object = None):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise self._exc_factory()
+        return _FakePostResponse(self._message)
+
+    def request(self, method: str, url: str, **kwargs):
+        return self.post(
+            url,
+            json=kwargs.get("json"),
+            headers=kwargs.get("headers"),
+            params=kwargs.get("params"),
+        )
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self) -> "_FlakyPostClient":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _silence_retry_sleep(monkeypatch) -> None:
+    monkeypatch.setenv("MAS_LLM_HTTP_RETRY_BACKOFF", "0.001")
+    monkeypatch.setattr("mas.runtime.reliability.retry.time.sleep", lambda _s: None)
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr("mas.runtime.reliability.retry.asyncio.sleep", _no_sleep)
+
+
+def test_openai_provider_retries_dropped_connection_then_succeeds(monkeypatch) -> None:
+    _silence_retry_sleep(monkeypatch)
+    client = _FlakyPostClient({"role": "assistant", "content": "ok"}, fail_times=2)
+    monkeypatch.setattr("httpx.Client", lambda **kwargs: client)
+    out = OpenAILLMProvider().chat_completion(model="gpt", messages=[{"role": "user", "content": "hi"}], api_key="k")
+    assert out["content"] == "ok"
+    assert client.calls == 3
+
+
+def test_openai_provider_gives_up_after_max_attempts(monkeypatch) -> None:
+    _silence_retry_sleep(monkeypatch)
+    client = _FlakyPostClient({"role": "assistant", "content": "ok"}, fail_times=10)
+    monkeypatch.setattr("httpx.Client", lambda **kwargs: client)
+    with pytest.raises(RuntimeError):
+        OpenAILLMProvider().chat_completion(model="gpt", messages=[{"role": "user", "content": "hi"}], api_key="k")
+    assert client.calls == 4
+
+
+def test_openai_provider_recreates_client_after_transport_failure(monkeypatch) -> None:
+    """A network change can wedge the pooled client; retry must use a fresh one."""
+    _silence_retry_sleep(monkeypatch)
+    created: list[_FlakyPostClient] = []
+
+    def factory(**kwargs):
+        fail_times = 10 if not created else 0
+        client = _FlakyPostClient({"role": "assistant", "content": "ok"}, fail_times=fail_times)
+        created.append(client)
+        return client
+
+    monkeypatch.setattr("httpx.Client", factory)
+    out = OpenAILLMProvider().chat_completion(model="gpt", messages=[{"role": "user", "content": "hi"}], api_key="k")
+    assert out["content"] == "ok"
+    assert len(created) == 2
+    assert created[0].calls == 1
+    assert created[1].calls == 1
+
+
+def test_openai_provider_keeps_client_after_http_429(monkeypatch) -> None:
+    _silence_retry_sleep(monkeypatch)
+
+    class _StatusThenOkClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.closed = 0
+
+        def request(self, method: str, url: str, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                req = httpx.Request(method, url)
+                return httpx.Response(429, request=req)
+            return _FakePostResponse({"role": "assistant", "content": "ok"})
+
+        def close(self) -> None:
+            self.closed += 1
+
+    client = _StatusThenOkClient()
+    monkeypatch.setattr("httpx.Client", lambda **kwargs: client)
+    out = OpenAILLMProvider().chat_completion(model="gpt", messages=[{"role": "user", "content": "hi"}], api_key="k")
+    assert out["content"] == "ok"
+    assert client.calls == 2
+    assert client.closed == 0
+
+
+def test_openai_provider_does_not_retry_auth_error(monkeypatch) -> None:
+    _silence_retry_sleep(monkeypatch)
+
+    def _auth_error() -> httpx.HTTPStatusError:
+        request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+        response = httpx.Response(401, request=request)
+        return httpx.HTTPStatusError("unauthorized", request=request, response=response)
+
+    client = _FlakyPostClient({"role": "assistant", "content": "ok"}, fail_times=1, exc_factory=_auth_error)
+    monkeypatch.setattr("httpx.Client", lambda **kwargs: client)
+    with pytest.raises(RuntimeError):
+        OpenAILLMProvider().chat_completion(model="gpt", messages=[{"role": "user", "content": "hi"}], api_key="k")
+    assert client.calls == 1
+
+
+class _FlakyStreamClient:
+    """`.stream()` raises a transport error the first `fail_times` calls."""
+
+    def __init__(self, lines: list[str], *, fail_times: int = 0, **_: object) -> None:
+        self._lines = lines
+        self._fail_times = fail_times
+        self.calls = 0
+
+    def stream(self, method: str, url: str, *, json: object, headers: object, params: object = None):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise httpx.ConnectError("boom")
+        return _FakeStreamResponse(self._lines)
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self) -> "_FlakyStreamClient":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def test_openai_provider_retries_stream_connect_failure(monkeypatch) -> None:
+    _silence_retry_sleep(monkeypatch)
+    lines = [
+        _sse({"choices": [{"delta": {"content": "Hi"}, "finish_reason": "stop"}]}),
+        "data: [DONE]",
+    ]
+    client = _FlakyStreamClient(lines, fail_times=2)
+    monkeypatch.setattr("httpx.Client", lambda **kwargs: client)
+    received: list[str] = []
+    provider = OpenAILLMProvider(stream=True)
+    message = provider.chat_completion(
+        model="gpt",
+        messages=[{"role": "user", "content": "hi"}],
+        api_key="k",
+        on_stream_chunk=received.append,
+    )
+    assert received == ["Hi"]
+    assert message["content"] == "Hi"
+    assert client.calls == 3
+
+
+class _DroppedMidStreamResponse:
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_lines(self):
+        yield from self._lines
+        raise httpx.RemoteProtocolError("peer closed connection")
+
+    def __enter__(self) -> "_DroppedMidStreamResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _MidStreamDropClient:
+    def __init__(self, lines: list[str], **_: object) -> None:
+        self._lines = lines
+        self.calls = 0
+
+    def stream(self, method: str, url: str, *, json: object, headers: object, params: object = None):
+        self.calls += 1
+        return _DroppedMidStreamResponse(self._lines)
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self) -> "_MidStreamDropClient":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def test_openai_provider_does_not_retry_after_partial_stream_emitted(monkeypatch) -> None:
+    from mas.runtime.reliability.classes import ClassifiedFailure, FailureClass
+
+    _silence_retry_sleep(monkeypatch)
+    lines = [_sse({"choices": [{"delta": {"content": "Hel"}}]})]
+    client = _MidStreamDropClient(lines)
+    monkeypatch.setattr("httpx.Client", lambda **kwargs: client)
+    received: list[str] = []
+    provider = OpenAILLMProvider(stream=True)
+    with pytest.raises(ClassifiedFailure) as caught:
+        provider.chat_completion(
+            model="gpt",
+            messages=[{"role": "user", "content": "hi"}],
+            api_key="k",
+            on_stream_chunk=received.append,
+        )
+    assert received == ["Hel"]
+    assert client.calls == 1
+    assert caught.value.failure_class is FailureClass.APPLICATION
+    assert caught.value.code == "STREAM_PARTIAL"
+
+
 def test_openai_provider_stream_ignores_reasoning_deltas(monkeypatch) -> None:
     lines = [
         _sse({"choices": [{"delta": {"reasoning_content": "secret", "content": "Hi"}}]}),
@@ -454,6 +732,9 @@ async def test_openai_achat_completion_uses_shared_request_builder(monkeypatch) 
                 params=kwargs.get("params"),
             )
 
+        async def aclose(self) -> None:
+            return None
+
     monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: _AsyncPostClient(**kwargs))
     provider = OpenAILLMProvider(reasoning={"effort": "low", "budget_tokens": 32, "exclude": True})
     out = await provider.achat_completion(
@@ -467,6 +748,263 @@ async def test_openai_achat_completion_uses_shared_request_builder(monkeypatch) 
     assert payload["reasoning_effort"] == "low"
     assert payload["max_completion_tokens"] == 900
     assert out["content"] == "Answer"
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_recreates_async_client_after_transport_failure(monkeypatch) -> None:
+    _silence_retry_sleep(monkeypatch)
+    created: list[_FlakyAsyncPostClient] = []
+
+    class _FlakyAsyncPostClient:
+        def __init__(self, *, fail_times: int) -> None:
+            self._fail_times = fail_times
+            self.calls = 0
+
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls += 1
+            if self.calls <= self._fail_times:
+                raise httpx.ConnectError("boom")
+            return _FakePostResponse({"role": "assistant", "content": "ok"})
+
+        async def aclose(self) -> None:
+            return None
+
+    def factory(**kwargs):
+        client = _FlakyAsyncPostClient(fail_times=10 if not created else 0)
+        created.append(client)
+        return client
+
+    monkeypatch.setattr("httpx.AsyncClient", factory)
+    out = await OpenAILLMProvider().achat_completion(
+        model="gpt", messages=[{"role": "user", "content": "hi"}], api_key="k"
+    )
+    assert out["content"] == "ok"
+    assert len(created) == 2
+    assert created[0].calls == 1
+    assert created[1].calls == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_does_not_retry_async_after_partial_stream(monkeypatch) -> None:
+    from mas.runtime.reliability.classes import ClassifiedFailure, FailureClass
+
+    _silence_retry_sleep(monkeypatch)
+
+    class _DroppedMidStreamAsyncResponse:
+        def __init__(self, lines: list[str]) -> None:
+            self._lines = lines
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_lines(self):
+            for line in self._lines:
+                yield line
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+        async def __aenter__(self) -> "_DroppedMidStreamAsyncResponse":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    class _MidStreamDropAsyncClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream(self, method: str, url: str, *, json: object, headers: object, params: object = None):
+            self.calls += 1
+            return _DroppedMidStreamAsyncResponse([_sse({"choices": [{"delta": {"content": "Hel"}}]})])
+
+        async def aclose(self) -> None:
+            return None
+
+    client = _MidStreamDropAsyncClient()
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: client)
+    received: list[str] = []
+    with pytest.raises(ClassifiedFailure) as caught:
+        await OpenAILLMProvider(stream=True).achat_completion(
+            model="gpt",
+            messages=[{"role": "user", "content": "hi"}],
+            api_key="k",
+            on_stream_chunk=received.append,
+        )
+    assert received == ["Hel"]
+    assert client.calls == 1
+    assert caught.value.failure_class is FailureClass.APPLICATION
+    assert caught.value.code == "STREAM_PARTIAL"
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_keeps_async_client_after_http_429(monkeypatch) -> None:
+    _silence_retry_sleep(monkeypatch)
+
+    class _StatusThenOkAsyncClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.closed = 0
+
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                req = httpx.Request(method, url)
+                return httpx.Response(429, request=req)
+            return _FakePostResponse({"role": "assistant", "content": "ok"})
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    client = _StatusThenOkAsyncClient()
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: client)
+    out = await OpenAILLMProvider().achat_completion(
+        model="gpt", messages=[{"role": "user", "content": "hi"}], api_key="k"
+    )
+    assert out["content"] == "ok"
+    assert client.calls == 2
+    assert client.closed == 0
+
+
+class _FakeAsyncStreamResponse:
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    def raise_for_status(self) -> None:
+        return None
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    async def __aenter__(self) -> "_FakeAsyncStreamResponse":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_retries_async_stream_connect_failure(monkeypatch) -> None:
+    _silence_retry_sleep(monkeypatch)
+    lines = [
+        _sse({"choices": [{"delta": {"content": "Hi"}, "finish_reason": "stop"}]}),
+        "data: [DONE]",
+    ]
+
+    class _FlakyAsyncStreamClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream(self, method: str, url: str, *, json: object, headers: object, params: object = None):
+            self.calls += 1
+            if self.calls <= 2:
+                raise httpx.ConnectError("boom")
+            return _FakeAsyncStreamResponse(lines)
+
+        async def aclose(self) -> None:
+            return None
+
+    client = _FlakyAsyncStreamClient()
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: client)
+    received: list[str] = []
+    message = await OpenAILLMProvider(stream=True).achat_completion(
+        model="gpt",
+        messages=[{"role": "user", "content": "hi"}],
+        api_key="k",
+        on_stream_chunk=received.append,
+    )
+    assert received == ["Hi"]
+    assert message["content"] == "Hi"
+    assert client.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_async_stream_records_usage(monkeypatch) -> None:
+    lines = [
+        _sse({"usage": {"prompt_tokens": 2}, "choices": [{"delta": {"content": "Hi"}, "finish_reason": "stop"}]}),
+        "data: [DONE]",
+    ]
+
+    class _AsyncStreamClient:
+        def stream(self, method: str, url: str, *, json: object, headers: object, params: object = None):
+            return _FakeAsyncStreamResponse(lines)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: _AsyncStreamClient())
+    message = await OpenAILLMProvider(stream=True).achat_completion(
+        model="gpt", messages=[{"role": "user", "content": "hi"}], api_key="k"
+    )
+    assert message["content"] == "Hi"
+    assert message["usage"] == {"prompt_tokens": 2}
+    assert message["finish_reason"] == "stop"
+
+
+def test_resolve_ssl_verify_falls_back_to_httpx_default(monkeypatch) -> None:
+    from mas.library.standard.plugins.llm import http as llm_http
+
+    monkeypatch.setattr(llm_http, "_system_ssl_context", lambda: None)
+    monkeypatch.setattr(llm_http, "_default_ca_bundle", lambda: None)
+    monkeypatch.delenv("MAS_LLM_VERIFY_SSL", raising=False)
+    assert llm_http.resolve_ssl_verify() is True
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_async_stream_skips_noise_and_accumulates_tool_calls(monkeypatch) -> None:
+    def _boom(text: str) -> None:
+        if text == "x":
+            raise RuntimeError("callback")
+
+    lines = [
+        "event: ping",
+        b"data: not-json",
+        "data: ",
+        _sse({"usage": {"prompt_tokens": 1}, "choices": []}),
+        _sse({"choices": [{"delta": {"content": "x"}}]}),
+        _sse(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [{"index": 0, "id": "c1", "function": {"name": "lookup", "arguments": "{"}}]
+                        }
+                    }
+                ]
+            }
+        ),
+        _sse(
+            {
+                "choices": [
+                    {
+                        "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]},
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+        ),
+        "data: [DONE]",
+    ]
+
+    class _AsyncStreamClient:
+        def stream(self, method: str, url: str, *, json: object, headers: object, params: object = None):
+            return _FakeAsyncStreamResponse(lines)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: _AsyncStreamClient())
+    message = await OpenAILLMProvider(stream=True).achat_completion(
+        model="gpt",
+        messages=[{"role": "user", "content": "hi"}],
+        api_key="k",
+        on_stream_chunk=_boom,
+    )
+    assert message["content"] == "x"
+    assert message["usage"] == {"prompt_tokens": 1}
+    assert message["finish_reason"] == "tool_calls"
+    assert message["tool_calls"] == [
+        {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+    ]
 
 
 @pytest.mark.asyncio
